@@ -25,7 +25,7 @@ ecosystem of editor integrations.
 ```
 $ cargo tree
 minimal v0.1.0 (examples/minimal)
-└── minijinja v2.2.0 (minijinja)
+└── minijinja v2.3.1 (minijinja)
     └── serde v1.0.144
 ```
 
@@ -128,6 +128,8 @@ If you are stuck with `MiniJinja`, have suggestions or need help, you can use th
 These are related template engines for Rust:
 
 * [Askama](https://crates.io/crates/askama): Jinja inspired, type-safe, requires template
+  precompilation. Has significant divergence from Jinja syntax in parts.
+* [Rinja](https://crates.io/crates/rinja): Jinja inspired, type-safe, requires template
   precompilation. Has significant divergence from Jinja syntax in parts.
 * [Tera](https://crates.io/crates/tera): Jinja inspired, dynamic, has divergences from Jinja.
 * [TinyTemplate](https://crates.io/crates/tinytemplate): minimal footprint template engine

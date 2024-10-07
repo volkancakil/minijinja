@@ -463,7 +463,7 @@ impl Hash for Value {
                 if let Ok(val) = i64::try_from(self.clone()) {
                     val.hash(state)
                 } else {
-                    as_f64(self).map(|x| x.to_bits()).hash(state)
+                    as_f64(self, true).map(|x| x.to_bits()).hash(state)
                 }
             }
         }
@@ -482,7 +482,7 @@ impl PartialEq for Value {
             (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a == b,
             (ValueRepr::SmallStr(a), ValueRepr::SmallStr(b)) => a.as_str() == b.as_str(),
             (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a == b,
-            _ => match ops::coerce(self, other) {
+            _ => match ops::coerce(self, other, false) {
                 Some(ops::CoerceResult::F64(a, b)) => a == b,
                 Some(ops::CoerceResult::I128(a, b)) => a == b,
                 Some(ops::CoerceResult::Str(a, b)) => a == b,
@@ -493,12 +493,34 @@ impl PartialEq for Value {
                         }
                         match (a.repr(), b.repr()) {
                             (ObjectRepr::Map, ObjectRepr::Map) => {
-                                if a.enumerator_len() != b.enumerator_len() {
+                                // only if we have known lengths can we compare the enumerators
+                                // ahead of time.  This function has a fallback for when a
+                                // map has an unknown length.  That's generally a bad idea, but
+                                // it makes sense supporting regardless as silent failures are
+                                // not a lot of fun.
+                                let mut need_length_fallback = true;
+                                if let (Some(a_len), Some(b_len)) =
+                                    (a.enumerator_len(), b.enumerator_len())
+                                {
+                                    if a_len != b_len {
+                                        return false;
+                                    }
+                                    need_length_fallback = false;
+                                }
+                                let mut a_count = 0;
+                                if !a.try_iter_pairs().map_or(false, |mut ak| {
+                                    ak.all(|(k, v1)| {
+                                        a_count += 1;
+                                        b.get_value(&k).map_or(false, |v2| v1 == v2)
+                                    })
+                                }) {
                                     return false;
                                 }
-                                a.try_iter_pairs().map_or(false, |mut ak| {
-                                    ak.all(|(k, v1)| b.get_value(&k).map_or(false, |v2| v1 == v2))
-                                })
+                                if !need_length_fallback {
+                                    true
+                                } else {
+                                    a_count == b.try_iter().map_or(0, |x| x.count())
+                                }
                             }
                             (
                                 ObjectRepr::Seq | ObjectRepr::Iterable,
@@ -540,44 +562,52 @@ fn f64_total_cmp(left: f64, right: f64) -> Ordering {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
-        let value_ordering = match (&self.0, &other.0) {
+        let kind_ordering = self.kind().cmp(&other.kind());
+        if matches!(kind_ordering, Ordering::Less | Ordering::Greater) {
+            return kind_ordering;
+        }
+        match (&self.0, &other.0) {
             (ValueRepr::None, ValueRepr::None) => Ordering::Equal,
             (ValueRepr::Undefined, ValueRepr::Undefined) => Ordering::Equal,
             (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a.cmp(b),
             (ValueRepr::SmallStr(a), ValueRepr::SmallStr(b)) => a.as_str().cmp(b.as_str()),
             (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a.cmp(b),
-            _ => match ops::coerce(self, other) {
+            _ => match ops::coerce(self, other, false) {
                 Some(ops::CoerceResult::F64(a, b)) => f64_total_cmp(a, b),
                 Some(ops::CoerceResult::I128(a, b)) => a.cmp(&b),
                 Some(ops::CoerceResult::Str(a, b)) => a.cmp(b),
-                None => match (self.kind(), other.kind()) {
-                    (ValueKind::Seq, ValueKind::Seq) => match (self.try_iter(), other.try_iter()) {
-                        (Ok(a), Ok(b)) => a.cmp(b),
-                        _ => self.len().cmp(&other.len()),
-                    },
-                    (ValueKind::Map, ValueKind::Map) => {
-                        if let (Some(a), Some(b)) = (self.as_object(), other.as_object()) {
-                            if a.is_same_object(b) {
-                                Ordering::Equal
-                            } else {
-                                // This is not really correct.  Because the keys can be in arbitrary
-                                // order this could just sort really weirdly as a result.  However
-                                // we don't want to pay the cost of actually sorting the keys for
-                                // ordering so we just accept this for now.
-                                match (a.try_iter_pairs(), b.try_iter_pairs()) {
-                                    (Some(a), Some(b)) => a.cmp(b),
-                                    _ => self.len().cmp(&other.len()),
-                                }
-                            }
+                None => {
+                    if let (Some(a), Some(b)) = (self.as_object(), other.as_object()) {
+                        if a.is_same_object(b) {
+                            Ordering::Equal
                         } else {
-                            unreachable!();
+                            match (a.repr(), b.repr()) {
+                                (ObjectRepr::Map, ObjectRepr::Map) => {
+                                    // This is not really correct.  Because the keys can be in arbitrary
+                                    // order this could just sort really weirdly as a result.  However
+                                    // we don't want to pay the cost of actually sorting the keys for
+                                    // ordering so we just accept this for now.
+                                    match (a.try_iter_pairs(), b.try_iter_pairs()) {
+                                        (Some(a), Some(b)) => a.cmp(b),
+                                        _ => unreachable!(),
+                                    }
+                                }
+                                (
+                                    ObjectRepr::Seq | ObjectRepr::Iterable,
+                                    ObjectRepr::Seq | ObjectRepr::Iterable,
+                                ) => match (a.try_iter(), b.try_iter()) {
+                                    (Some(a), Some(b)) => a.cmp(b),
+                                    _ => unreachable!(),
+                                },
+                                (_, _) => unreachable!(),
+                            }
                         }
+                    } else {
+                        unreachable!()
                     }
-                    _ => Ordering::Equal,
-                },
+                }
             },
-        };
-        value_ordering.then((self.kind() as usize).cmp(&(other.kind() as usize)))
+        }
     }
 }
 
@@ -968,6 +998,17 @@ impl Value {
                 | ValueRepr::F64(_)
                 | ValueRepr::I128(_)
                 | ValueRepr::U128(_)
+        )
+    }
+
+    /// Returns true if the number is a real integer.
+    ///
+    /// This can be used to distinguish `42` from `42.0`.  For the most part
+    /// the engine keeps these the same.
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self.0,
+            ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::I128(_) | ValueRepr::U128(_)
         )
     }
 
@@ -1459,6 +1500,15 @@ impl Value {
             }
         }
         Ok(rv)
+    }
+
+    #[cfg(feature = "builtins")]
+    pub(crate) fn get_path_or_default(&self, path: &str, default: &Value) -> Value {
+        match self.get_path(path) {
+            Err(_) => default.clone(),
+            Ok(val) if val.is_undefined() => default.clone(),
+            Ok(val) => val,
+        }
     }
 }
 
