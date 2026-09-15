@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::fmt;
 
 use crate::compiler::tokens::Span;
-use crate::value::{value_map_with_capacity, Value};
+use crate::value::{ops, value_map_with_capacity, Value};
 
 /// Container for nodes with location info.
 ///
@@ -14,22 +14,20 @@ use crate::value::{value_map_with_capacity, Value};
 /// to become too large.
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Spanned<T> {
-    node: Box<T>,
-    span: Span,
+    inner: Box<(T, Span)>,
 }
 
 impl<T> Spanned<T> {
     /// Creates a new spanned node.
     pub fn new(node: T, span: Span) -> Spanned<T> {
         Spanned {
-            node: Box::new(node),
-            span,
+            inner: Box::new((node, span)),
         }
     }
 
     /// Accesses the span.
     pub fn span(&self) -> Span {
-        self.span
+        self.inner.1
     }
 }
 
@@ -37,15 +35,15 @@ impl<T> Deref for Spanned<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.node
+        &self.inner.0
     }
 }
 
 #[cfg(feature = "internal_debug")]
 impl<T: fmt::Debug> fmt::Debug for Spanned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ok!(fmt::Debug::fmt(&self.node, f));
-        write!(f, "{:?}", self.span)
+        ok!(fmt::Debug::fmt(&self.inner.0, f));
+        write!(f, "{:?}", self.inner.1)
     }
 }
 
@@ -88,7 +86,7 @@ pub enum Stmt<'a> {
 }
 
 #[cfg(feature = "internal_debug")]
-impl<'a> fmt::Debug for Stmt<'a> {
+impl fmt::Debug for Stmt<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Stmt::Template(s) => fmt::Debug::fmt(s, f),
@@ -137,6 +135,7 @@ pub enum Expr<'a> {
     Slice(Spanned<Slice<'a>>),
     UnaryOp(Spanned<UnaryOp<'a>>),
     BinOp(Spanned<BinOp<'a>>),
+    Compare(Spanned<Compare<'a>>),
     IfExpr(Spanned<IfExpr<'a>>),
     Filter(Spanned<Filter<'a>>),
     Test(Spanned<Test<'a>>),
@@ -144,12 +143,12 @@ pub enum Expr<'a> {
     GetItem(Spanned<GetItem<'a>>),
     Call(Spanned<Call<'a>>),
     List(Spanned<List<'a>>),
+    Tuple(Spanned<Tuple<'a>>),
     Map(Spanned<Map<'a>>),
-    Kwargs(Spanned<Kwargs<'a>>),
 }
 
 #[cfg(feature = "internal_debug")]
-impl<'a> fmt::Debug for Expr<'a> {
+impl fmt::Debug for Expr<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Var(s) => fmt::Debug::fmt(s, f),
@@ -157,6 +156,7 @@ impl<'a> fmt::Debug for Expr<'a> {
             Expr::Slice(s) => fmt::Debug::fmt(s, f),
             Expr::UnaryOp(s) => fmt::Debug::fmt(s, f),
             Expr::BinOp(s) => fmt::Debug::fmt(s, f),
+            Expr::Compare(s) => fmt::Debug::fmt(s, f),
             Expr::IfExpr(s) => fmt::Debug::fmt(s, f),
             Expr::Filter(s) => fmt::Debug::fmt(s, f),
             Expr::Test(s) => fmt::Debug::fmt(s, f),
@@ -164,13 +164,13 @@ impl<'a> fmt::Debug for Expr<'a> {
             Expr::GetItem(s) => fmt::Debug::fmt(s, f),
             Expr::Call(s) => fmt::Debug::fmt(s, f),
             Expr::List(s) => fmt::Debug::fmt(s, f),
+            Expr::Tuple(s) => fmt::Debug::fmt(s, f),
             Expr::Map(s) => fmt::Debug::fmt(s, f),
-            Expr::Kwargs(s) => fmt::Debug::fmt(s, f),
         }
     }
 }
 
-impl<'a> Expr<'a> {
+impl Expr<'_> {
     pub fn description(&self) -> &'static str {
         match self {
             Expr::Var(_) => "variable",
@@ -178,16 +178,113 @@ impl<'a> Expr<'a> {
             Expr::Slice(_)
             | Expr::UnaryOp(_)
             | Expr::BinOp(_)
+            | Expr::Compare(_)
             | Expr::IfExpr(_)
             | Expr::GetAttr(_)
             | Expr::GetItem(_) => "expression",
             Expr::Call(_) => "call",
             Expr::List(_) => "list literal",
+            Expr::Tuple(_) => "tuple literal",
             Expr::Map(_) => "map literal",
             Expr::Test(_) => "test expression",
             Expr::Filter(_) => "filter expression",
-            Expr::Kwargs(_) => "keyword arguments",
         }
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Var(s) => s.span(),
+            Expr::Const(s) => s.span(),
+            Expr::Slice(s) => s.span(),
+            Expr::UnaryOp(s) => s.span(),
+            Expr::BinOp(s) => s.span(),
+            Expr::Compare(s) => s.span(),
+            Expr::IfExpr(s) => s.span(),
+            Expr::Filter(s) => s.span(),
+            Expr::Test(s) => s.span(),
+            Expr::GetAttr(s) => s.span(),
+            Expr::GetItem(s) => s.span(),
+            Expr::Call(s) => s.span(),
+            Expr::List(s) => s.span(),
+            Expr::Tuple(s) => s.span(),
+            Expr::Map(s) => s.span(),
+        }
+    }
+
+    pub fn as_const(&self) -> Option<Value> {
+        match self {
+            Expr::Const(c) => Some(c.value.clone()),
+            Expr::List(l) => l.as_const(),
+            Expr::Tuple(t) => t.as_const(),
+            Expr::Map(m) => m.as_const(),
+            Expr::UnaryOp(c) => match c.op {
+                UnaryOpKind::Not => c.expr.as_const().map(|value| Value::from(!value.is_true())),
+                UnaryOpKind::Neg => c.expr.as_const().and_then(|v| ops::neg(&v).ok()),
+            },
+            Expr::BinOp(c) => {
+                let (Some(left), Some(right)) = (c.left.as_const(), c.right.as_const()) else {
+                    return None;
+                };
+                eval_binop(c.op, &left, &right)
+            }
+            Expr::Compare(c) => {
+                let mut left = c.expr.as_const()?;
+                for op in &c.ops {
+                    let right = op.expr.as_const()?;
+                    if !eval_compare(op.op, &left, &right)?.is_true() {
+                        return Some(Value::from(false));
+                    }
+                    left = right;
+                }
+                Some(Value::from(true))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn eval_binop(op: BinOpKind, left: &Value, right: &Value) -> Option<Value> {
+    match op {
+        BinOpKind::Add => ops::add(left, right).ok(),
+        BinOpKind::Sub => ops::sub(left, right).ok(),
+        BinOpKind::Mul => ops::mul(left, right).ok(),
+        BinOpKind::Div => ops::div(left, right).ok(),
+        BinOpKind::FloorDiv => ops::int_div(left, right).ok(),
+        BinOpKind::Rem => ops::rem(left, right).ok(),
+        BinOpKind::Pow => ops::pow(left, right).ok(),
+        BinOpKind::Concat => Some(ops::string_concat(left.clone(), right)),
+        BinOpKind::Eq => Some(Value::from(left == right)),
+        BinOpKind::Ne => Some(Value::from(left != right)),
+        BinOpKind::Lt => Some(Value::from(left < right)),
+        BinOpKind::Lte => Some(Value::from(left <= right)),
+        BinOpKind::Gt => Some(Value::from(left > right)),
+        BinOpKind::Gte => Some(Value::from(left >= right)),
+        BinOpKind::In => ops::contains(right, left).ok(),
+        BinOpKind::ScAnd => Some(if left.is_true() && right.is_true() {
+            right.clone()
+        } else {
+            Value::from(false)
+        }),
+        BinOpKind::ScOr => Some(if left.is_true() {
+            left.clone()
+        } else {
+            right.clone()
+        }),
+    }
+}
+
+fn eval_compare(op: CompareOpKind, left: &Value, right: &Value) -> Option<Value> {
+    match op {
+        CompareOpKind::Eq => Some(Value::from(left == right)),
+        CompareOpKind::Ne => Some(Value::from(left != right)),
+        CompareOpKind::Lt => Some(Value::from(left < right)),
+        CompareOpKind::Lte => Some(Value::from(left <= right)),
+        CompareOpKind::Gt => Some(Value::from(left > right)),
+        CompareOpKind::Gte => Some(Value::from(left >= right)),
+        CompareOpKind::In => ops::contains(right, left).ok(),
+        CompareOpKind::NotIn => ops::contains(right, left)
+            .ok()
+            .map(|value| Value::from(!value.is_true())),
     }
 }
 
@@ -250,6 +347,7 @@ pub struct SetBlock<'a> {
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Block<'a> {
     pub name: &'a str,
+    pub required: bool,
     pub body: Vec<Stmt<'a>>,
 }
 
@@ -397,7 +495,23 @@ pub struct UnaryOp<'a> {
     pub expr: Expr<'a>,
 }
 
+/// A kind of comparison operator.
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "internal_debug", derive(Debug))]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
+pub enum CompareOpKind {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    In,
+    NotIn,
+}
+
 /// A kind of binary operator.
+#[derive(Copy, Clone)]
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub enum BinOpKind {
@@ -429,6 +543,22 @@ pub struct BinOp<'a> {
     pub right: Expr<'a>,
 }
 
+/// A comparison operand in a chained comparison.
+#[cfg_attr(feature = "internal_debug", derive(Debug))]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
+pub struct CompareOp<'a> {
+    pub op: CompareOpKind,
+    pub expr: Expr<'a>,
+}
+
+/// A chained comparison expression.
+#[cfg_attr(feature = "internal_debug", derive(Debug))]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
+pub struct Compare<'a> {
+    pub expr: Expr<'a>,
+    pub ops: Vec<CompareOp<'a>>,
+}
+
 /// An if expression.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
@@ -444,7 +574,7 @@ pub struct IfExpr<'a> {
 pub struct Filter<'a> {
     pub name: &'a str,
     pub expr: Option<Expr<'a>>,
-    pub args: Vec<Expr<'a>>,
+    pub args: Vec<CallArg<'a>>,
 }
 
 /// A test expression.
@@ -453,7 +583,7 @@ pub struct Filter<'a> {
 pub struct Test<'a> {
     pub name: &'a str,
     pub expr: Expr<'a>,
-    pub args: Vec<Expr<'a>>,
+    pub args: Vec<CallArg<'a>>,
 }
 
 /// An attribute lookup expression.
@@ -477,7 +607,32 @@ pub struct GetItem<'a> {
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Call<'a> {
     pub expr: Expr<'a>,
-    pub args: Vec<Expr<'a>>,
+    pub args: Vec<CallArg<'a>>,
+}
+
+/// A call argument helper
+#[cfg_attr(feature = "internal_debug", derive(Debug))]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
+pub enum CallArg<'a> {
+    Pos(Expr<'a>),
+    Kwarg(&'a str, Expr<'a>),
+    PosSplat(Expr<'a>),
+    KwargSplat(Expr<'a>),
+}
+
+fn const_values(items: &[Expr<'_>]) -> Option<Vec<Value>> {
+    if !items.iter().all(|expr| matches!(expr, Expr::Const(_))) {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .filter_map(|expr| match expr {
+                Expr::Const(value) => Some(value.value.clone()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Creates a list of values.
@@ -487,43 +642,24 @@ pub struct List<'a> {
     pub items: Vec<Expr<'a>>,
 }
 
-impl<'a> List<'a> {
+impl List<'_> {
     pub fn as_const(&self) -> Option<Value> {
-        if !self.items.iter().all(|x| matches!(x, Expr::Const(_))) {
-            return None;
-        }
-
-        let items = self.items.iter();
-        let sequence = items.filter_map(|expr| match expr {
-            Expr::Const(v) => Some(v.value.clone()),
-            _ => None,
-        });
-
-        Some(Value::from(sequence.collect::<Vec<_>>()))
+        Some(Value::from(const_values(&self.items)?))
     }
 }
 
-/// Creates a map of kwargs
+/// Creates a tuple of values.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
-pub struct Kwargs<'a> {
-    pub pairs: Vec<(&'a str, Expr<'a>)>,
+pub struct Tuple<'a> {
+    pub items: Vec<Expr<'a>>,
 }
 
-impl<'a> Kwargs<'a> {
+impl Tuple<'_> {
     pub fn as_const(&self) -> Option<Value> {
-        if !self.pairs.iter().all(|x| matches!(x.1, Expr::Const(_))) {
-            return None;
-        }
-
-        let mut rv = value_map_with_capacity(self.pairs.len());
-        for (key, value) in &self.pairs {
-            if let Expr::Const(value) = value {
-                rv.insert(Value::from(*key), value.value.clone());
-            }
-        }
-
-        Some(crate::value::Kwargs::wrap(rv))
+        Some(Value::from(crate::value::Tuple::from(const_values(
+            &self.items,
+        )?)))
     }
 }
 
@@ -535,7 +671,7 @@ pub struct Map<'a> {
     pub values: Vec<Expr<'a>>,
 }
 
-impl<'a> Map<'a> {
+impl Map<'_> {
     pub fn as_const(&self) -> Option<Value> {
         if !self.keys.iter().all(|x| matches!(x, Expr::Const(_)))
             || !self.values.iter().all(|x| matches!(x, Expr::Const(_)))

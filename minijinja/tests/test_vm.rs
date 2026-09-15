@@ -1,8 +1,8 @@
 #![cfg(feature = "unstable_machinery")]
 use std::collections::BTreeMap;
 
-use minijinja::machinery::{make_string_output, CodeGenerator, Instruction, Instructions, Vm};
-use minijinja::value::Value;
+use minijinja::machinery::{eval, make_string_output, CodeGenerator, Instruction, Instructions};
+use minijinja::value::{Serde, Value};
 use minijinja::{AutoEscape, Environment, Error};
 
 use similar_asserts::assert_eq;
@@ -13,11 +13,11 @@ pub fn simple_eval<S: serde::Serialize>(
 ) -> Result<String, Error> {
     let env = Environment::new();
     let empty_blocks = BTreeMap::new();
-    let vm = Vm::new(&env);
-    let root = Value::from_serialize(&ctx);
+    let root = Value::from(Serde(&ctx));
     let mut rv = String::new();
     let mut output = make_string_output(&mut rv);
-    vm.eval(
+    eval(
+        &env,
         instructions,
         root,
         &empty_blocks,
@@ -140,7 +140,7 @@ fn test_op_eq() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 
     let mut c = CodeGenerator::new("hello.html", "");
     c.add(Instruction::LoadConst(Value::from(1)));
@@ -149,7 +149,7 @@ fn test_op_eq() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn test_op_ne() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from("foo")));
@@ -170,7 +170,7 @@ fn test_op_ne() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn test_op_lt() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from(2)));
@@ -191,7 +191,7 @@ fn test_op_lt() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn test_op_gt() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from(2)));
@@ -212,7 +212,7 @@ fn test_op_gt() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn test_op_lte() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from(2)));
@@ -233,7 +233,7 @@ fn test_op_lte() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn test_op_gte() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from(1)));
@@ -254,7 +254,7 @@ fn test_op_gte() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn test_op_not() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "true");
+    assert_eq!(output, "True");
 
     let mut c = CodeGenerator::new("<unknown>", "");
     c.add(Instruction::LoadConst(Value::from(true)));
@@ -273,7 +273,7 @@ fn test_op_not() {
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();
-    assert_eq!(output, "false");
+    assert_eq!(output, "False");
 }
 
 #[test]
@@ -307,7 +307,7 @@ fn test_call_object() {
         42 + a
     })));
     c.add(Instruction::LoadConst(Value::from(23i32)));
-    c.add(Instruction::CallObject(2));
+    c.add(Instruction::CallObject(Some(2)));
     c.add(Instruction::Emit);
 
     let output = simple_eval(&c.finish().0, ()).unwrap();

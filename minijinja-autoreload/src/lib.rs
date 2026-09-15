@@ -109,7 +109,7 @@ pub struct EnvironmentGuard<'reloader> {
     mutex_guard: MutexGuard<'reloader, Option<Environment<'static>>>,
 }
 
-impl<'reloader> Deref for EnvironmentGuard<'reloader> {
+impl Deref for EnvironmentGuard<'_> {
     type Target = Environment<'static>;
 
     fn deref(&self) -> &Self::Target {
@@ -279,18 +279,16 @@ impl Notifier {
     }
 
     fn fast_reload(&self) -> bool {
-        let handle = match self.handle() {
-            Some(handle) => handle,
-            None => return false,
+        let Some(handle) = self.handle() else {
+            return false;
         };
         let inner = handle.lock().unwrap();
         inner.fast_reload
     }
 
     fn should_reload(&self) -> bool {
-        let handle = match self.handle() {
-            Some(handle) => handle,
-            None => return false,
+        let Some(handle) = self.handle() else {
+            return false;
         };
         let inner = handle.lock().unwrap();
 
@@ -302,7 +300,7 @@ impl Notifier {
             return true;
         }
 
-        let should_reload = inner.should_reload_callback.as_ref().map_or(false, |x| x());
+        let should_reload = inner.should_reload_callback.as_ref().is_some_and(|x| x());
 
         if should_reload {
             if let Some(callback) = inner.on_should_reload_callback.as_ref() {
@@ -317,9 +315,8 @@ impl Notifier {
     fn with_fs_watcher<F: FnOnce(&mut notify::RecommendedWatcher)>(&self, f: F) {
         use notify::event::{EventKind, ModifyKind};
 
-        let handle = match self.handle() {
-            Some(handle) => handle,
-            None => return,
+        let Some(handle) = self.handle() else {
+            return;
         };
         let weak_handle = Arc::downgrade(&handle);
         f(handle

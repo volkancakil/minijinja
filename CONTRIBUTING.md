@@ -5,6 +5,24 @@ contribution from everyone in the form of suggestions, bug reports, pull
 requests, and feedback. This document gives some guidance if you are thinking of
 helping out.
 
+## AI Disclosure
+
+> [!IMPORTANT]
+>
+> If you are using **any kind of AI assistance** to contribute to MiniJinja,
+> it must be disclosed in the pull request.
+
+If you are using any kind of AI assistance while contributing to this project
+you must disclose this in the pull request and the extent to which it was.  When
+you use AI for PR descriptions you also must disclose that.
+
+It is rude not to disclose AI usage to the reviewer and it makes it hard to
+understand how much scrutiny needs to be placed on the contribution.
+
+I am a strong supporter and users of AI, however I also recognize the challenges
+that lack of disclosure presents on Open Source projects.  Please be respectful
+to maintainers and your fellow humans.
+
 ## Submitting Bug Reports and Feature Requests
 
 When reporting a bug or asking for help, please include enough details so that
@@ -17,25 +35,19 @@ and fill out the fields in the appropriate provided template.
 When making a feature request, please make it clear what problem you intend to
 solve with the feature and maybe provide some ideas for how to go about that.
 
-## MiniJinja 1
-
-The main branch is pointing to the not yet released major version of MiniJinja1.  For
-the old 1.x versions see head over to the `minijinja-1.x` branch:
-[`minijinja-1.x`](https://github.com/mitsuhiko/minijinja/tree/minijinja-1.x)
-
 ## Rust toolchain
-MiniJinja targets [Rust 1.61.0](https://blog.rust-lang.org/2022/05/19/Rust-1.61.0.html) as it's MSRV (Minimum Supported Rust Version).
+MiniJinja targets [Rust 1.63.0](https://blog.rust-lang.org/2022/08/11/Rust-1.63.0.html) as it's MSRV (Minimum Supported Rust Version).
 
 If you use nightly Rust, you might be using features that aren't supported yet by stable.
 
 Using [rustup](https://rustup.rs/) is a straight forward way to manage your installed toolchains, you have a couple of options
-to run `1.61.0` locally in the MiniJinja project:
+to run `1.63.0` locally in the MiniJinja project:
 
 1. You can also create a [rust-toolchain.toml](https://rust-lang.github.io/rustup/concepts/toolchains.html) file in the root directory:
 
 ```toml
 [toolchain]
-channel = "1.61.0"
+channel = "1.63.0"
 ```
 
 Then running `rustup update` will ensure you have the latest stable toolchain.
@@ -44,14 +56,10 @@ Then running `rustup update` will ensure you have the latest stable toolchain.
 set the MiniJinja directory to use the stable toolchain:
 
 ```sh
-rustup override set 1.61.0
+rustup override set 1.63.0
 ```
 
-To verify you are on 1.61.0, you can use `rustc --version`:
-
-```sh
-rustc 1.61.0 (fe5b13d68 2022-05-18)
-```
+To verify you are on 1.63.0, you can use `rustc --version`.
 
 You can also use `rustup toolchain list`, which will show the installed and currently used toolchain.
 

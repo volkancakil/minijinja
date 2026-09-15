@@ -19,6 +19,14 @@
 
 
 /*
+ Auto escaping modes for callback-based configuration.
+ */
+typedef enum mj_auto_escape {
+  MJ_AUTO_ESCAPE_NONE,
+  MJ_AUTO_ESCAPE_HTML,
+} mj_auto_escape;
+
+/*
  The kind of error that occurred.
  */
 typedef enum mj_err_kind {
@@ -35,7 +43,7 @@ typedef enum mj_err_kind {
   MJ_ERR_KIND_UNKNOWN_METHOD,
   MJ_ERR_KIND_BAD_ESCAPE,
   MJ_ERR_KIND_UNDEFINED_ERROR,
-  KJ_ERROR_KIND_BAD_SERIALIZTION,
+  MJ_ERROR_KIND_BAD_SERIALIZTION,
   MJ_ERR_KIND_BAD_INCLUDE,
   MJ_ERR_KIND_EVAL_BLOCK,
   MJ_ERR_KIND_CANNOT_UNPACK,
@@ -92,8 +100,43 @@ typedef struct mj_value_iter mj_value_iter;
  Opaque value type.
  */
 typedef struct mj_value {
-  uintptr_t _opaque[3];
+  uint64_t _opaque[3];
 } mj_value;
+
+/*
+ Callback used for custom functions, filters and tests.
+
+ Returns `true` on success and writes the return value into `rv_out`.
+ Returns `false` on failure.
+ */
+typedef bool (*mj_value_callback)(void *userdata,
+                                  const struct mj_value *args,
+                                  uintptr_t argc,
+                                  struct mj_value *rv_out);
+
+/*
+ Callback used for user data cleanup.
+ */
+typedef void (*mj_user_data_free)(void *userdata);
+
+/*
+ Callback used to select auto escaping for a template name.
+ */
+typedef enum mj_auto_escape (*mj_auto_escape_callback)(void *userdata, const char *name);
+
+/*
+ Callback used for loading template source by name.
+
+ Return `NULL` if the template was not found.
+ */
+typedef const char *(*mj_loader_callback)(void *userdata, const char *name);
+
+/*
+ Callback used to join include paths.
+
+ Return `NULL` to indicate an error.
+ */
+typedef const char *(*mj_path_join_callback)(void *userdata, const char *name, const char *parent);
 
 /*
  Allows one to override the syntax elements.
@@ -114,9 +157,51 @@ extern "C" {
 #endif // __cplusplus
 
 /*
+ Registers a C callback as filter.
+ */
+MINIJINJA_API
+bool mj_env_add_filter(struct mj_env *env,
+                       const char *name,
+                       mj_value_callback callback,
+                       void *userdata,
+                       mj_user_data_free free_func);
+
+/*
+ Registers a C callback as template function.
+ */
+MINIJINJA_API
+bool mj_env_add_function(struct mj_env *env,
+                         const char *name,
+                         mj_value_callback callback,
+                         void *userdata,
+                         mj_user_data_free free_func);
+
+/*
+ Adds a global value to the environment.
+
+ Takes ownership of the given value.
+ */
+MINIJINJA_API bool mj_env_add_global(struct mj_env *env, const char *name, struct mj_value value);
+
+/*
  Registers a template with the environment.
  */
 MINIJINJA_API bool mj_env_add_template(struct mj_env *env, const char *name, const char *source);
+
+/*
+ Registers a C callback as test.
+ */
+MINIJINJA_API
+bool mj_env_add_test(struct mj_env *env,
+                     const char *name,
+                     mj_value_callback callback,
+                     void *userdata,
+                     mj_user_data_free free_func);
+
+/*
+ Clears the fuel budget.
+ */
+MINIJINJA_API void mj_env_clear_fuel(struct mj_env *env);
 
 /*
  Clears all templates.
@@ -148,6 +233,8 @@ MINIJINJA_API bool mj_env_remove_template(struct mj_env *env, const char *name);
 
 /*
  Renders a template from a named string.
+
+ Takes ownership of the given context.
  */
 MINIJINJA_API
 char *mj_env_render_named_str(const struct mj_env *env,
@@ -157,6 +244,8 @@ char *mj_env_render_named_str(const struct mj_env *env,
 
 /*
  Renders a template registered on the environment.
+
+ Takes ownership of the given context.
  */
 MINIJINJA_API
 char *mj_env_render_template(const struct mj_env *env,
@@ -164,9 +253,23 @@ char *mj_env_render_template(const struct mj_env *env,
                              struct mj_value ctx);
 
 /*
+ Configures a callback for auto escaping.
+ */
+MINIJINJA_API
+bool mj_env_set_auto_escape_callback(struct mj_env *env,
+                                     mj_auto_escape_callback callback,
+                                     void *userdata,
+                                     mj_user_data_free free_func);
+
+/*
  Enables or disables debug mode.
  */
 MINIJINJA_API void mj_env_set_debug(struct mj_env *env, bool val);
+
+/*
+ Sets the fuel budget for expression evaluation and rendering.
+ */
+MINIJINJA_API void mj_env_set_fuel(struct mj_env *env, uint64_t fuel);
 
 /*
  Preserve the trailing newline when rendering templates.
@@ -174,9 +277,27 @@ MINIJINJA_API void mj_env_set_debug(struct mj_env *env, bool val);
 MINIJINJA_API void mj_env_set_keep_trailing_newline(struct mj_env *env, bool val);
 
 /*
+ Configures a callback-based template loader.
+ */
+MINIJINJA_API
+bool mj_env_set_loader(struct mj_env *env,
+                       mj_loader_callback callback,
+                       void *userdata,
+                       mj_user_data_free free_func);
+
+/*
  Enables or disables the `lstrip_blocks` feature.
  */
 MINIJINJA_API void mj_env_set_lstrip_blocks(struct mj_env *env, bool val);
+
+/*
+ Configures a callback for joining include paths.
+ */
+MINIJINJA_API
+bool mj_env_set_path_join_callback(struct mj_env *env,
+                                   mj_path_join_callback callback,
+                                   void *userdata,
+                                   mj_user_data_free free_func);
 
 /*
  Changes the recursion limit.
@@ -208,9 +329,14 @@ void mj_env_set_undefined_behavior(struct mj_env *env,
 MINIJINJA_API void mj_err_clear(void);
 
 /*
+ Returns the error's debug info if there is an error.
+ */
+MINIJINJA_API char *mj_err_get_debug_info(void);
+
+/*
  Returns the error's description if there is an error.
  */
-MINIJINJA_API const char *mj_err_get_detail(void);
+MINIJINJA_API char *mj_err_get_detail(void);
 
 /*
  Returns the error's kind
@@ -225,7 +351,7 @@ MINIJINJA_API uint32_t mj_err_get_line(void);
 /*
  Returns the error's current template.
  */
-MINIJINJA_API const char *mj_err_get_template_name(void);
+MINIJINJA_API char *mj_err_get_template_name(void);
 
 /*
  Returns `true` if there is currently an error.
@@ -251,6 +377,11 @@ MINIJINJA_API void mj_syntax_config_default(struct mj_syntax_config *syntax);
  Appends a value to a list
  */
 MINIJINJA_API bool mj_value_append(struct mj_value *slf, struct mj_value value);
+
+/*
+ If the value is a string or bytes, returns it the pointer
+ */
+MINIJINJA_API const char *mj_value_as_bytes(struct mj_value value, uintptr_t *len_out);
 
 /*
  Extracts a float from the value
@@ -288,7 +419,7 @@ MINIJINJA_API struct mj_value mj_value_get_by_index(struct mj_value value, uint6
 MINIJINJA_API struct mj_value mj_value_get_by_str(struct mj_value value, const char *key);
 
 /*
- Looks up an element by a vaue
+ Looks up an element by a value
  */
 MINIJINJA_API struct mj_value mj_value_get_by_value(struct mj_value value, struct mj_value key);
 
@@ -331,6 +462,11 @@ MINIJINJA_API uint64_t mj_value_len(struct mj_value value);
  Creates a new boolean value
  */
 MINIJINJA_API struct mj_value mj_value_new_bool(bool value);
+
+/*
+ Creates an new bytes value
+ */
+MINIJINJA_API struct mj_value mj_value_new_bytes(const char *b, uintptr_t length);
 
 /*
  Creates a new f32 value

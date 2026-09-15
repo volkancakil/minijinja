@@ -31,7 +31,7 @@ impl Object for Highlighter {
         ObjectRepr::Plain
     }
 
-    fn call(self: &Arc<Self>, state: &State<'_, '_>, args: &[Value]) -> Result<Value, Error> {
+    fn call(self: &Arc<Self>, state: &mut State<'_, '_>, args: &[Value]) -> Result<Value, Error> {
         let (lang, kwargs): (&str, Kwargs) = from_args(args)?;
         let caller: Value = kwargs.get("caller")?;
         let content = caller.call(state, args!())?;
@@ -49,7 +49,7 @@ impl Object for Highlighter {
         let syntax = self.ss.find_syntax_by_token(lang).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidOperation,
-                format!("unknown language {}", lang),
+                format!("unknown language {lang}"),
             )
         })?;
         kwargs.assert_all_used()?;

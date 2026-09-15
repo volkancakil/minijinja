@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+#[cfg(feature = "multi_template")]
 use std::collections::BTreeSet;
 use std::fmt;
+use std::mem;
 
 use crate::compiler::ast::{self, Spanned};
 use crate::compiler::lexer::{Tokenizer, WhitespaceConfig};
@@ -95,7 +97,7 @@ enum SetParseResult<'a> {
 
 struct TokenStream<'a> {
     tokenizer: Tokenizer<'a>,
-    current: Option<Result<(Token<'a>, Span), Error>>,
+    current: Result<Option<(Token<'a>, Span)>, Error>,
     last_span: Span,
 }
 
@@ -103,12 +105,14 @@ impl<'a> TokenStream<'a> {
     /// Tokenize a template
     pub fn new(
         source: &'a str,
+        filename: &'a str,
         in_expr: bool,
         syntax_config: SyntaxConfig,
         whitespace_config: WhitespaceConfig,
     ) -> TokenStream<'a> {
-        let mut tokenizer = Tokenizer::new(source, in_expr, syntax_config, whitespace_config);
-        let current = tokenizer.next_token().transpose();
+        let mut tokenizer =
+            Tokenizer::new(source, filename, in_expr, syntax_config, whitespace_config);
+        let current = tokenizer.next_token();
         TokenStream {
             tokenizer,
             current,
@@ -117,21 +121,33 @@ impl<'a> TokenStream<'a> {
     }
 
     /// Advance the stream.
+    #[inline(always)]
     pub fn next(&mut self) -> Result<Option<(Token<'a>, Span)>, Error> {
-        let rv = self.current.take();
-        self.current = self.tokenizer.next_token().transpose();
-        if let Some(Ok((_, span))) = rv {
-            self.last_span = span;
+        let rv = mem::replace(&mut self.current, self.tokenizer.next_token());
+        match rv {
+            Ok(Some((token, span))) => {
+                self.last_span = span;
+                Ok(Some((token, span)))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
         }
-        rv.transpose()
     }
 
     /// Look at the current token
+    #[inline(always)]
     pub fn current(&mut self) -> Result<Option<(&Token<'a>, Span)>, Error> {
+        if self.current.is_err() {
+            return match mem::replace(&mut self.current, Ok(None)) {
+                Err(err) => Err(err),
+                _ => unreachable!(),
+            };
+        }
+
         match self.current {
-            Some(Ok(ref tok)) => Ok(Some((&tok.0, tok.1))),
-            Some(Err(_)) => Err(self.current.take().unwrap().unwrap_err()),
-            None => Ok(None),
+            Ok(Some((ref token, span))) => Ok(Some((token, span))),
+            Ok(None) => Ok(None),
+            Err(_) => unreachable!(),
         }
     }
 
@@ -147,10 +163,9 @@ impl<'a> TokenStream<'a> {
     /// Returns the current span.
     #[inline(always)]
     pub fn current_span(&self) -> Span {
-        if let Some(Ok((_, span))) = self.current {
-            span
-        } else {
-            self.last_span
+        match self.current {
+            Ok(Some((_, span))) => span,
+            _ => self.last_span,
         }
     }
 
@@ -163,11 +178,11 @@ impl<'a> TokenStream<'a> {
 
 struct Parser<'a> {
     stream: TokenStream<'a>,
-    #[allow(unused)]
+    #[cfg(all(feature = "macros", feature = "multi_template"))]
     in_macro: bool,
-    #[allow(unused)]
+    #[cfg(feature = "loop_controls")]
     in_loop: bool,
-    #[allow(unused)]
+    #[cfg(feature = "multi_template")]
     blocks: BTreeSet<&'a str>,
     depth: usize,
 }
@@ -229,19 +244,61 @@ macro_rules! with_recursion_guard {
 }
 
 impl<'a> Parser<'a> {
+    /// Creates a new parser.
+    ///
+    /// `in_expr` is necessary to parse within an expression context.  Otherwise
+    /// the parser starts out in template context.  This means that when
+    /// [`parse`](Self::parse) is to be called, the `in_expr` argument must be
+    /// `false` and for [`parse_standalone_expr`](Self::parse_standalone_expr)
+    /// it must be `true`.
     pub fn new(
         source: &'a str,
+        filename: &'a str,
         in_expr: bool,
         syntax_config: SyntaxConfig,
         whitespace_config: WhitespaceConfig,
     ) -> Parser<'a> {
         Parser {
-            stream: TokenStream::new(source, in_expr, syntax_config, whitespace_config),
+            stream: TokenStream::new(source, filename, in_expr, syntax_config, whitespace_config),
+            #[cfg(all(feature = "macros", feature = "multi_template"))]
             in_macro: false,
+            #[cfg(feature = "loop_controls")]
             in_loop: false,
+            #[cfg(feature = "multi_template")]
             blocks: BTreeSet::new(),
             depth: 0,
         }
+    }
+
+    /// Parses a template.
+    pub fn parse(&mut self) -> Result<ast::Stmt<'a>, Error> {
+        let span = self.stream.last_span();
+        self.subparse(&|_| false)
+            .map(|children| {
+                ast::Stmt::Template(Spanned::new(
+                    ast::Template { children },
+                    self.stream.expand_span(span),
+                ))
+            })
+            .map_err(|err| self.attach_location_to_error(err))
+    }
+
+    /// Parses an expression and asserts that there is no more input after it.
+    pub fn parse_standalone_expr(&mut self) -> Result<ast::Expr<'a>, Error> {
+        self.parse_expr()
+            .and_then(|result| {
+                if ok!(self.stream.next()).is_some() {
+                    syntax_error!("unexpected input after expression")
+                } else {
+                    Ok(result)
+                }
+            })
+            .map_err(|err| self.attach_location_to_error(err))
+    }
+
+    /// Returns the current filename.
+    pub fn filename(&self) -> &str {
+        self.stream.tokenizer.filename()
     }
 
     fn parse_ifexpr(&mut self) -> Result<ast::Expr<'a>, Error> {
@@ -282,49 +339,73 @@ impl<'a> Parser<'a> {
     });
 
     fn parse_compare(&mut self) -> Result<ast::Expr<'a>, Error> {
-        let mut span = self.stream.last_span();
-        let mut expr = ok!(self.parse_math1());
+        let span = self.stream.last_span();
+        let expr = ok!(self.parse_math1());
+        let mut ops = Vec::new();
         loop {
-            let mut negated = false;
             let op = match ok!(self.stream.current()) {
-                Some((Token::Eq, _)) => ast::BinOpKind::Eq,
-                Some((Token::Ne, _)) => ast::BinOpKind::Ne,
-                Some((Token::Lt, _)) => ast::BinOpKind::Lt,
-                Some((Token::Lte, _)) => ast::BinOpKind::Lte,
-                Some((Token::Gt, _)) => ast::BinOpKind::Gt,
-                Some((Token::Gte, _)) => ast::BinOpKind::Gte,
-                Some((Token::Ident("in"), _)) => ast::BinOpKind::In,
+                Some((Token::Eq, _)) => ast::CompareOpKind::Eq,
+                Some((Token::Ne, _)) => ast::CompareOpKind::Ne,
+                Some((Token::Lt, _)) => ast::CompareOpKind::Lt,
+                Some((Token::Lte, _)) => ast::CompareOpKind::Lte,
+                Some((Token::Gt, _)) => ast::CompareOpKind::Gt,
+                Some((Token::Gte, _)) => ast::CompareOpKind::Gte,
+                Some((Token::Ident("in"), _)) => ast::CompareOpKind::In,
                 Some((Token::Ident("not"), _)) => {
                     ok!(self.stream.next());
                     expect_token!(self, Token::Ident("in"), "in");
-                    negated = true;
-                    ast::BinOpKind::In
+                    ast::CompareOpKind::NotIn
                 }
                 _ => break,
             };
-            if !negated {
+            if !matches!(op, ast::CompareOpKind::NotIn) {
                 ok!(self.stream.next());
             }
-            expr = ast::Expr::BinOp(Spanned::new(
-                ast::BinOp {
-                    op,
-                    left: expr,
-                    right: ok!(self.parse_math1()),
-                },
-                self.stream.expand_span(span),
-            ));
-            if negated {
-                expr = ast::Expr::UnaryOp(Spanned::new(
-                    ast::UnaryOp {
-                        op: ast::UnaryOpKind::Not,
-                        expr,
+            ops.push(ast::CompareOp {
+                op,
+                expr: ok!(self.parse_math1()),
+            });
+        }
+
+        Ok(match ops.len() {
+            0 => expr,
+            1 => {
+                let op = ops.pop().unwrap();
+                let (binop, negated) = match op.op {
+                    ast::CompareOpKind::Eq => (ast::BinOpKind::Eq, false),
+                    ast::CompareOpKind::Ne => (ast::BinOpKind::Ne, false),
+                    ast::CompareOpKind::Lt => (ast::BinOpKind::Lt, false),
+                    ast::CompareOpKind::Lte => (ast::BinOpKind::Lte, false),
+                    ast::CompareOpKind::Gt => (ast::BinOpKind::Gt, false),
+                    ast::CompareOpKind::Gte => (ast::BinOpKind::Gte, false),
+                    ast::CompareOpKind::In => (ast::BinOpKind::In, false),
+                    ast::CompareOpKind::NotIn => (ast::BinOpKind::In, true),
+                };
+                let expr = ast::Expr::BinOp(Spanned::new(
+                    ast::BinOp {
+                        op: binop,
+                        left: expr,
+                        right: op.expr,
                     },
                     self.stream.expand_span(span),
                 ));
+                if negated {
+                    ast::Expr::UnaryOp(Spanned::new(
+                        ast::UnaryOp {
+                            op: ast::UnaryOpKind::Not,
+                            expr,
+                        },
+                        self.stream.expand_span(span),
+                    ))
+                } else {
+                    expr
+                }
             }
-            span = self.stream.last_span();
-        }
-        Ok(expr)
+            _ => ast::Expr::Compare(Spanned::new(
+                ast::Compare { expr, ops },
+                self.stream.expand_span(span),
+            )),
+        })
     }
 
     binop!(parse_math1, parse_concat, {
@@ -365,11 +446,34 @@ impl<'a> Parser<'a> {
             match ok!(self.stream.current()) {
                 Some((Token::Dot, _)) => {
                     ok!(self.stream.next());
-                    let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
-                    expr = ast::Expr::GetAttr(Spanned::new(
-                        ast::GetAttr { name, expr },
-                        self.stream.expand_span(span),
-                    ));
+                    match ok!(self.stream.next()) {
+                        Some((Token::Ident(name), _)) => {
+                            expr = ast::Expr::GetAttr(Spanned::new(
+                                ast::GetAttr { name, expr },
+                                self.stream.expand_span(span),
+                            ));
+                        }
+                        Some((Token::Int(idx), idx_span)) => {
+                            expr = ast::Expr::GetItem(Spanned::new(
+                                ast::GetItem {
+                                    expr,
+                                    subscript_expr: make_const(Value::from(idx), idx_span),
+                                },
+                                self.stream.expand_span(span),
+                            ));
+                        }
+                        Some((Token::Int128(idx), idx_span)) => {
+                            expr = ast::Expr::GetItem(Spanned::new(
+                                ast::GetItem {
+                                    expr,
+                                    subscript_expr: make_const(Value::from(*idx), idx_span),
+                                },
+                                self.stream.expand_span(span),
+                            ));
+                        }
+                        Some((token, _)) => return Err(unexpected(token, "identifier or integer")),
+                        None => return Err(unexpected_eof("identifier or integer")),
+                    }
                 }
                 Some((Token::BracketOpen, _)) => {
                     ok!(self.stream.next());
@@ -431,14 +535,35 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    fn parse_filter_test_name(&mut self) -> Result<(&'a str, Span), Error> {
+        let (first_segment, span) = expect_token!(self, Token::Ident(name) => name, "identifier");
+        let start_offset = span.start_offset as usize;
+        let mut end_offset = span.end_offset as usize;
+        let mut is_dotted = false;
+
+        while skip_token!(self, Token::Dot) {
+            let (_, segment_span) = expect_token!(self, Token::Ident(name) => name, "identifier");
+            end_offset = segment_span.end_offset as usize;
+            is_dotted = true;
+        }
+
+        if is_dotted {
+            Ok((
+                &self.stream.tokenizer.source()[start_offset..end_offset],
+                self.stream.expand_span(span),
+            ))
+        } else {
+            Ok((first_segment, span))
+        }
+    }
+
     fn parse_filter_expr(&mut self, expr: ast::Expr<'a>) -> Result<ast::Expr<'a>, Error> {
         let mut expr = expr;
         loop {
             match ok!(self.stream.current()) {
                 Some((Token::Pipe, _)) => {
                     ok!(self.stream.next());
-                    let (name, span) =
-                        expect_token!(self, Token::Ident(name) => name, "identifier");
+                    let (name, span) = ok!(self.parse_filter_test_name());
                     let args = if matches_token!(self, Token::ParenOpen) {
                         ok!(self.parse_args())
                     } else {
@@ -456,10 +581,32 @@ impl<'a> Parser<'a> {
                 Some((Token::Ident("is"), _)) => {
                     ok!(self.stream.next());
                     let negated = skip_token!(self, Token::Ident("not"));
-                    let (name, span) =
-                        expect_token!(self, Token::Ident(name) => name, "identifier");
+                    let (name, span) = ok!(self.parse_filter_test_name());
                     let args = if matches_token!(self, Token::ParenOpen) {
                         ok!(self.parse_args())
+                    } else if matches_token!(
+                        self,
+                        Token::Ident(_)
+                            | Token::Str(_)
+                            | Token::String(_)
+                            | Token::Int(_)
+                            | Token::Int128(_)
+                            | Token::Float(_)
+                            | Token::Plus
+                            | Token::Minus
+                            | Token::BracketOpen
+                            | Token::BraceOpen
+                    ) && !matches_token!(
+                        self,
+                        Token::Ident("and")
+                            | Token::Ident("or")
+                            | Token::Ident("else")
+                            | Token::Ident("is")
+                    ) {
+                        let span = self.stream.current_span();
+                        let mut expr = ok!(self.parse_unary_only());
+                        expr = ok!(self.parse_postfix(expr, span));
+                        vec![ast::CallArg::Pos(expr)]
                     } else {
                         Vec::new()
                     };
@@ -483,49 +630,76 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    fn parse_args(&mut self) -> Result<Vec<ast::Expr<'a>>, Error> {
+    fn parse_args(&mut self) -> Result<Vec<ast::CallArg<'a>>, Error> {
         let mut args = Vec::new();
         let mut first_span = None;
-        let mut kwargs = Vec::new();
+        let mut has_kwargs = false;
+
+        enum ArgType {
+            Regular,
+            Splat,
+            KwargsSplat,
+        }
 
         expect_token!(self, Token::ParenOpen, "`(`");
         loop {
             if skip_token!(self, Token::ParenClose) {
                 break;
             }
-            if !args.is_empty() || !kwargs.is_empty() {
+            if !args.is_empty() || has_kwargs {
                 expect_token!(self, Token::Comma, "`,`");
                 if skip_token!(self, Token::ParenClose) {
                     break;
                 }
             }
+
+            let arg_type = if skip_token!(self, Token::Pow) {
+                ArgType::KwargsSplat
+            } else if skip_token!(self, Token::Mul) {
+                ArgType::Splat
+            } else {
+                ArgType::Regular
+            };
+
             let expr = ok!(self.parse_expr());
 
-            // keyword argument
-            match expr {
-                ast::Expr::Var(ref var) if skip_token!(self, Token::Assign) => {
-                    if first_span.is_none() {
-                        first_span = Some(var.span());
+            match arg_type {
+                ArgType::Regular => {
+                    // keyword argument
+                    match expr {
+                        ast::Expr::Var(ref var) if skip_token!(self, Token::Assign) => {
+                            if first_span.is_none() {
+                                first_span = Some(var.span());
+                            }
+                            has_kwargs = true;
+                            args.push(ast::CallArg::Kwarg(var.id, ok!(self.parse_expr())));
+                        }
+                        _ if has_kwargs => {
+                            return Err(syntax_error(Cow::Borrowed(
+                                "non-keyword arg after keyword arg",
+                            )));
+                        }
+                        _ => {
+                            args.push(ast::CallArg::Pos(expr));
+                        }
                     }
-                    kwargs.push((var.id, ok!(self.parse_expr_noif())));
                 }
-                _ if !kwargs.is_empty() => {
-                    return Err(syntax_error(Cow::Borrowed(
-                        "non-keyword arg after keyword arg",
-                    )));
+                ArgType::Splat => {
+                    args.push(ast::CallArg::PosSplat(expr));
                 }
-                _ => {
-                    args.push(expr);
+                ArgType::KwargsSplat => {
+                    args.push(ast::CallArg::KwargSplat(expr));
+                    has_kwargs = true;
                 }
             }
-        }
 
-        if !kwargs.is_empty() {
-            args.push(ast::Expr::Kwargs(ast::Spanned::new(
-                ast::Kwargs { pairs: kwargs },
-                self.stream.expand_span(first_span.unwrap()),
-            )));
-        };
+            // Set an arbitrary limit of max function parameters.  This is done
+            // in parts because the opcodes can only express 2**16 as argument
+            // count.
+            if args.len() > 2000 {
+                syntax_error!("Too many arguments in function call")
+            }
+        }
 
         Ok(args)
     }
@@ -547,21 +721,32 @@ impl<'a> Parser<'a> {
             Token::Ident("false" | "False") => Ok(const_val!(false)),
             Token::Ident("none" | "None") => Ok(const_val!(())),
             Token::Ident(name) => Ok(ast::Expr::Var(Spanned::new(ast::Var { id: name }, span))),
-            Token::Str(val) => {
-                if matches_token!(self, Token::Str(_)) {
-                    let mut buf = String::from(val);
-                    while let Some((Token::Str(s), _)) = ok!(self.stream.current()) {
-                        buf.push_str(s);
-                        ok!(self.stream.next());
-                    }
-                    Ok(const_val!(buf))
-                } else {
-                    Ok(const_val!(val))
-                }
+            Token::Str(val)
+                if !matches!(
+                    self.stream.current(),
+                    Ok(Some((Token::Str(_), _) | (Token::String(_), _)))
+                ) =>
+            {
+                Ok(const_val!(val))
             }
-            Token::String(val) => Ok(const_val!(val)),
+            Token::Str(_) | Token::String(_) => {
+                let mut buf = match token {
+                    Token::Str(s) => s.to_owned(),
+                    Token::String(s) => s.into_string(),
+                    _ => unreachable!(),
+                };
+                loop {
+                    match ok!(self.stream.current()) {
+                        Some((Token::Str(s), _)) => buf.push_str(s),
+                        Some((Token::String(s), _)) => buf.push_str(s),
+                        _ => break,
+                    }
+                    ok!(self.stream.next());
+                }
+                Ok(const_val!(buf))
+            }
             Token::Int(val) => Ok(const_val!(val)),
-            Token::Int128(val) => Ok(const_val!(val)),
+            Token::Int128(val) => Ok(const_val!(*val)),
             Token::Float(val) => Ok(const_val!(val)),
             Token::ParenOpen => self.parse_tuple_or_expression(span),
             Token::BracketOpen => self.parse_list_expr(span),
@@ -571,7 +756,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_list_expr(&mut self, span: Span) -> Result<ast::Expr<'a>, Error> {
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(4);
         loop {
             if skip_token!(self, Token::BracketClose) {
                 break;
@@ -591,8 +776,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_map_expr(&mut self, span: Span) -> Result<ast::Expr<'a>, Error> {
-        let mut keys = Vec::new();
-        let mut values = Vec::new();
+        let mut keys = Vec::with_capacity(4);
+        let mut values = Vec::with_capacity(4);
         loop {
             if skip_token!(self, Token::BraceClose) {
                 break;
@@ -614,11 +799,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_tuple_or_expression(&mut self, span: Span) -> Result<ast::Expr<'a>, Error> {
-        // MiniJinja does not really have tuples, but it treats the tuple
-        // syntax the same as lists.
         if skip_token!(self, Token::ParenClose) {
-            return Ok(ast::Expr::List(Spanned::new(
-                ast::List { items: vec![] },
+            return Ok(ast::Expr::Tuple(Spanned::new(
+                ast::Tuple { items: vec![] },
                 self.stream.expand_span(span),
             )));
         }
@@ -635,8 +818,8 @@ impl<'a> Parser<'a> {
                 }
                 items.push(ok!(self.parse_expr()));
             }
-            expr = ast::Expr::List(Spanned::new(
-                ast::List { items },
+            expr = ast::Expr::Tuple(Spanned::new(
+                ast::Tuple { items },
                 self.stream.expand_span(span),
             ));
         } else {
@@ -645,11 +828,11 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    pub fn parse_expr(&mut self) -> Result<ast::Expr<'a>, Error> {
+    fn parse_expr(&mut self) -> Result<ast::Expr<'a>, Error> {
         with_recursion_guard!(self, self.parse_ifexpr())
     }
 
-    pub fn parse_expr_noif(&mut self) -> Result<ast::Expr<'a>, Error> {
+    fn parse_expr_noif(&mut self) -> Result<ast::Expr<'a>, Error> {
         self.parse_or()
     }
 
@@ -735,9 +918,9 @@ impl<'a> Parser<'a> {
         Ok(rv)
     }
 
-    fn parse_assignment(&mut self) -> Result<ast::Expr<'a>, Error> {
+    fn parse_assignment(&mut self, dotted: bool) -> Result<ast::Expr<'a>, Error> {
         let span = self.stream.current_span();
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(2);
         let mut is_tuple = false;
 
         loop {
@@ -751,11 +934,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             items.push(if skip_token!(self, Token::ParenOpen) {
-                let rv = ok!(self.parse_assignment());
+                let rv = ok!(self.parse_assignment(dotted));
                 expect_token!(self, Token::ParenClose, "`)`");
                 rv
             } else {
-                ok!(self.parse_assign_name(false))
+                ok!(self.parse_assign_name(dotted))
             });
             if matches_token!(self, Token::Comma) {
                 is_tuple = true;
@@ -775,8 +958,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for_stmt(&mut self) -> Result<ast::ForLoop<'a>, Error> {
+        #[cfg(feature = "loop_controls")]
         let old_in_loop = std::mem::replace(&mut self.in_loop, true);
-        let target = ok!(self.parse_assignment());
+        let target = ok!(self.parse_assignment(false));
         expect_token!(self, Token::Ident("in"), "in");
         let iter = ok!(self.parse_expr_noif());
         let filter_expr = if skip_token!(self, Token::Ident("if")) {
@@ -794,7 +978,10 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
         ok!(self.stream.next());
-        self.in_loop = old_in_loop;
+        #[cfg(feature = "loop_controls")]
+        {
+            self.in_loop = old_in_loop;
+        }
         Ok(ast::ForLoop {
             target,
             iter,
@@ -832,14 +1019,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_with_block(&mut self) -> Result<ast::WithBlock<'a>, Error> {
-        let mut assignments = Vec::new();
+        let mut assignments = Vec::with_capacity(2);
 
         while !matches_token!(self, Token::BlockEnd) {
             if !assignments.is_empty() {
                 expect_token!(self, Token::Comma, "comma");
             }
             let target = if skip_token!(self, Token::ParenOpen) {
-                let assign = ok!(self.parse_assignment());
+                let assign = ok!(self.parse_assignment(false));
                 expect_token!(self, Token::ParenClose, "`)`");
                 assign
             } else {
@@ -857,15 +1044,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_set(&mut self) -> Result<SetParseResult<'a>, Error> {
-        let (target, in_paren) = if skip_token!(self, Token::ParenOpen) {
-            let assign = ok!(self.parse_assignment());
-            expect_token!(self, Token::ParenClose, "`)`");
-            (assign, true)
-        } else {
-            (ok!(self.parse_assign_name(true)), false)
-        };
+        let target = ok!(self.parse_assignment(true));
 
-        if !in_paren && matches_token!(self, Token::BlockEnd | Token::Pipe) {
+        if matches_token!(self, Token::BlockEnd | Token::Pipe) {
             let filter = if skip_token!(self, Token::Pipe) {
                 Some(ok!(self.parse_filter_chain()))
             } else {
@@ -881,18 +1062,51 @@ impl<'a> Parser<'a> {
             }))
         } else {
             expect_token!(self, Token::Assign, "assignment operator");
+
+            // Parse RHS - single expression or comma-separated tuple
             let expr = ok!(self.parse_expr());
+            let expr = if skip_token!(self, Token::Comma) {
+                let span = self.stream.current_span();
+                let mut items = vec![expr];
+                loop {
+                    if matches_token!(self, Token::BlockEnd) {
+                        break;
+                    }
+                    items.push(ok!(self.parse_expr()));
+                    if !skip_token!(self, Token::Comma) {
+                        break;
+                    }
+                }
+                ast::Expr::Tuple(Spanned::new(
+                    ast::Tuple { items },
+                    self.stream.expand_span(span),
+                ))
+            } else {
+                expr
+            };
+
             Ok(SetParseResult::Set(ast::Set { target, expr }))
         }
     }
 
     #[cfg(feature = "multi_template")]
     fn parse_block(&mut self) -> Result<ast::Block<'a>, Error> {
+        #[cfg(feature = "macros")]
         if self.in_macro {
             syntax_error!("block tags in macros are not allowed");
         }
+        #[cfg(feature = "loop_controls")]
         let old_in_loop = std::mem::replace(&mut self.in_loop, false);
         let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
+        if matches_token!(self, Token::Ident("scoped")) {
+            ok!(self.stream.next());
+        }
+        let required = if matches_token!(self, Token::Ident("required")) {
+            ok!(self.stream.next());
+            true
+        } else {
+            false
+        };
         if !self.blocks.insert(name) {
             syntax_error!("block '{}' defined twice", name);
         }
@@ -900,6 +1114,15 @@ impl<'a> Parser<'a> {
         expect_token!(self, Token::BlockEnd, "end of block");
         let body = ok!(self.subparse(&|tok| matches!(tok, Token::Ident("endblock"))));
         ok!(self.stream.next());
+
+        if required
+            && !body.iter().all(|stmt| match stmt {
+                ast::Stmt::EmitRaw(raw) => raw.raw.trim().is_empty(),
+                _ => false,
+            })
+        {
+            syntax_error!("Required blocks can only contain comments or whitespace");
+        }
 
         if let Some((Token::Ident(trailing_name), _)) = ok!(self.stream.current()) {
             if *trailing_name != name {
@@ -911,9 +1134,16 @@ impl<'a> Parser<'a> {
             }
             ok!(self.stream.next());
         }
-        self.in_loop = old_in_loop;
+        #[cfg(feature = "loop_controls")]
+        {
+            self.in_loop = old_in_loop;
+        }
 
-        Ok(ast::Block { name, body })
+        Ok(ast::Block {
+            name,
+            required,
+            body,
+        })
     }
     fn parse_auto_escape(&mut self) -> Result<ast::AutoEscape<'a>, Error> {
         let enabled = ok!(self.parse_expr());
@@ -930,7 +1160,7 @@ impl<'a> Parser<'a> {
             if filter.is_some() {
                 expect_token!(self, Token::Pipe, "`|`");
             }
-            let (name, span) = expect_token!(self, Token::Ident(name) => name, "identifier");
+            let (name, span) = ok!(self.parse_filter_test_name());
             let args = if matches_token!(self, Token::ParenOpen) {
                 ok!(self.parse_args())
             } else {
@@ -966,17 +1196,12 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "multi_template")]
     fn parse_include(&mut self) -> Result<ast::Include<'a>, Error> {
         let name = ok!(self.parse_expr());
-
-        // with/without context is without meaning in MiniJinja, but for syntax
-        // compatibility it's supported.
-        if skip_token!(self, Token::Ident("without" | "with")) {
-            expect_token!(self, Token::Ident("context"), "missing keyword");
-        }
+        let skipped_context = ok!(self.skip_context_marker());
 
         let ignore_missing = if skip_token!(self, Token::Ident("ignore")) {
             expect_token!(self, Token::Ident("missing"), "missing keyword");
-            if skip_token!(self, Token::Ident("without" | "with")) {
-                expect_token!(self, Token::Ident("context"), "missing keyword");
+            if !skipped_context {
+                ok!(self.skip_context_marker());
             }
             true
         } else {
@@ -993,22 +1218,23 @@ impl<'a> Parser<'a> {
         let expr = ok!(self.parse_expr());
         expect_token!(self, Token::Ident("as"), "as");
         let name = ok!(self.parse_expr());
+        ok!(self.skip_context_marker());
         Ok(ast::Import { expr, name })
     }
 
     #[cfg(feature = "multi_template")]
     fn parse_from_import(&mut self) -> Result<ast::FromImport<'a>, Error> {
         let expr = ok!(self.parse_expr());
-        let mut names = Vec::new();
+        let mut names = Vec::with_capacity(4);
         expect_token!(self, Token::Ident("import"), "import");
         loop {
-            if matches_token!(self, Token::BlockEnd) {
+            if ok!(self.skip_context_marker()) || matches_token!(self, Token::BlockEnd) {
                 break;
             }
             if !names.is_empty() {
                 expect_token!(self, Token::Comma, "`,`");
             }
-            if matches_token!(self, Token::BlockEnd) {
+            if ok!(self.skip_context_marker()) || matches_token!(self, Token::BlockEnd) {
                 break;
             }
             let name = ok!(self.parse_assign_name(false));
@@ -1020,6 +1246,18 @@ impl<'a> Parser<'a> {
             names.push((name, alias));
         }
         Ok(ast::FromImport { expr, names })
+    }
+
+    #[cfg(feature = "multi_template")]
+    fn skip_context_marker(&mut self) -> Result<bool, Error> {
+        // with/without context is without meaning in MiniJinja, but for syntax
+        // copatibility it's supported.
+        if skip_token!(self, Token::Ident("with") | Token::Ident("without")) {
+            expect_token!(self, Token::Ident("context"), "context");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     #[cfg(feature = "macros")]
@@ -1056,15 +1294,23 @@ impl<'a> Parser<'a> {
         name: Option<&'a str>,
     ) -> Result<ast::Macro<'a>, Error> {
         expect_token!(self, Token::BlockEnd, "end of block");
+        #[cfg(feature = "loop_controls")]
         let old_in_loop = std::mem::replace(&mut self.in_loop, false);
+        #[cfg(feature = "multi_template")]
         let old_in_macro = std::mem::replace(&mut self.in_macro, true);
         let body = ok!(self.subparse(&|tok| match tok {
             Token::Ident("endmacro") if name.is_some() => true,
             Token::Ident("endcall") if name.is_none() => true,
             _ => false,
         }));
-        self.in_macro = old_in_macro;
-        self.in_loop = old_in_loop;
+        #[cfg(feature = "multi_template")]
+        {
+            self.in_macro = old_in_macro;
+        }
+        #[cfg(feature = "loop_controls")]
+        {
+            self.in_loop = old_in_loop;
+        }
         ok!(self.stream.next());
         Ok(ast::Macro {
             name: name.unwrap_or("caller"),
@@ -1078,8 +1324,8 @@ impl<'a> Parser<'a> {
     fn parse_macro(&mut self) -> Result<ast::Macro<'a>, Error> {
         let (name, _) = expect_token!(self, Token::Ident(name) => name, "identifier");
         expect_token!(self, Token::ParenOpen, "`(`");
-        let mut args = Vec::new();
-        let mut defaults = Vec::new();
+        let mut args = Vec::with_capacity(4);
+        let mut defaults = Vec::with_capacity(4);
         ok!(self.parse_macro_args_and_defaults(&mut args, &mut defaults));
         self.parse_macro_or_call_block_body(args, defaults, Some(name))
     }
@@ -1087,8 +1333,8 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "macros")]
     fn parse_call_block(&mut self) -> Result<ast::CallBlock<'a>, Error> {
         let span = self.stream.last_span();
-        let mut args = Vec::new();
-        let mut defaults = Vec::new();
+        let mut args = Vec::with_capacity(4);
+        let mut defaults = Vec::with_capacity(4);
         if skip_token!(self, Token::ParenOpen) {
             ok!(self.parse_macro_args_and_defaults(&mut args, &mut defaults));
         }
@@ -1121,7 +1367,7 @@ impl<'a> Parser<'a> {
         &mut self,
         end_check: &dyn Fn(&Token) -> bool,
     ) -> Result<Vec<ast::Stmt<'a>>, Error> {
-        let mut rv = Vec::new();
+        let mut rv = Vec::with_capacity(16);
         while let Some((token, span)) = ok!(self.stream.next()) {
             match token {
                 Token::TemplateData(raw) => {
@@ -1152,49 +1398,33 @@ impl<'a> Parser<'a> {
         Ok(rv)
     }
 
-    pub fn parse(&mut self) -> Result<ast::Stmt<'a>, Error> {
-        let span = self.stream.last_span();
-        Ok(ast::Stmt::Template(Spanned::new(
-            ast::Template {
-                children: ok!(self.subparse(&|_| false)),
-            },
-            self.stream.expand_span(span),
-        )))
+    #[inline]
+    fn attach_location_to_error(&mut self, mut err: Error) -> Error {
+        if err.line().is_none() {
+            err.set_filename_and_span(self.filename(), self.stream.last_span())
+        }
+        err
     }
 }
 
 /// Parses a template.
 pub fn parse<'source>(
     source: &'source str,
-    filename: &str,
+    filename: &'source str,
     syntax_config: SyntaxConfig,
     whitespace_config: WhitespaceConfig,
 ) -> Result<ast::Stmt<'source>, Error> {
-    let mut parser = Parser::new(source, false, syntax_config, whitespace_config);
-    parser.parse().map_err(|mut err| {
-        if err.line().is_none() {
-            err.set_filename_and_span(filename, parser.stream.last_span())
-        }
-        err
-    })
+    Parser::new(source, filename, false, syntax_config, whitespace_config).parse()
 }
 
-/// Parses an expression
+/// Parses a standalone expression.
 pub fn parse_expr(source: &str) -> Result<ast::Expr<'_>, Error> {
-    let mut parser = Parser::new(source, true, Default::default(), Default::default());
-    parser
-        .parse_expr()
-        .and_then(|result| {
-            if ok!(parser.stream.next()).is_some() {
-                syntax_error!("unexpected input after expression")
-            } else {
-                Ok(result)
-            }
-        })
-        .map_err(|mut err| {
-            if err.line().is_none() {
-                err.set_filename_and_span("<expression>", parser.stream.last_span())
-            }
-            err
-        })
+    Parser::new(
+        source,
+        "<expression>",
+        true,
+        Default::default(),
+        Default::default(),
+    )
+    .parse_standalone_expr()
 }

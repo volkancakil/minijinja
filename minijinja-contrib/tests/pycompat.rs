@@ -9,6 +9,16 @@ fn eval_expr(expr: &str) -> Value {
     env.compile_expression(expr).unwrap().eval(()).unwrap()
 }
 
+fn eval_err_expr(expr: &str) -> String {
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(unknown_method_callback);
+    env.compile_expression(expr)
+        .unwrap()
+        .eval(())
+        .unwrap_err()
+        .to_string()
+}
+
 #[test]
 fn test_string_methods() {
     assert_eq!(eval_expr("'foo'.upper()").as_str(), Some("FOO"));
@@ -67,9 +77,39 @@ fn test_dict_methods() {
     assert!(eval_expr("{'x': 42}.items()|list == [('x', 42)]").is_true());
     assert!(eval_expr("{'x': 42}.get('x') == 42").is_true());
     assert!(eval_expr("{'x': 42}.get('y') is none").is_true());
+    assert!(eval_expr("{'x': 42}.get('x', 47) == 42").is_true());
+    assert!(eval_expr("{'x': 42}.get('y', 47) == 47").is_true());
+    assert!(eval_expr(
+        "{'items': 'FIELD', 'x': 42}.items()|list == [('items', 'FIELD'), ('x', 42)]"
+    )
+    .is_true());
+
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(unknown_method_callback);
+    env.add_global("item_fn", Value::from_function(|| 42));
+    assert!(env
+        .compile_expression("{'items': item_fn, 'x': 23}.items()|list|length == 2")
+        .unwrap()
+        .eval(())
+        .unwrap()
+        .is_true());
+    assert!(env
+        .compile_expression("{'items': item_fn}['items']() == 42")
+        .unwrap()
+        .eval(())
+        .unwrap()
+        .is_true());
 }
 
 #[test]
 fn test_list_methods() {
     assert!(eval_expr("[1, 2, 2, 3].count(2) == 2").is_true());
+}
+
+#[test]
+fn test_errors() {
+    assert!(eval_err_expr("'abc'.split(1, 2)").contains("value is not a string"));
+    assert!(eval_err_expr("'abc'.startswith(1)")
+        .contains("startswith argument must be string or a tuple of strings, not number"));
+    assert!(eval_err_expr("{'x': 42}.get()").contains("missing argument"));
 }

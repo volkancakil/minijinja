@@ -21,6 +21,21 @@ pub type LocalId = u8;
 /// The maximum number of filters/tests that can be cached.
 pub const MAX_LOCALS: usize = 50;
 
+/// A comparison operation.
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "internal_debug", derive(Debug))]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    In,
+    NotIn,
+}
+
 /// Represents an instruction for the VM.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
 #[cfg_attr(
@@ -60,11 +75,20 @@ pub enum Instruction<'source> {
     /// Builds a kwargs map of the last n pairs on the stack.
     BuildKwargs(usize),
 
+    /// Merges N kwargs maps on the list into one.
+    MergeKwargs(usize),
+
     /// Builds a list of the last n pairs on the stack.
     BuildList(Option<usize>),
 
+    /// Builds a tuple of the last n pairs on the stack.
+    BuildTuple(Option<usize>),
+
     /// Unpacks a list into N stack items.
     UnpackList(usize),
+
+    /// Unpacks N lists onto the stack and pushes the number of items there were unpacked.
+    UnpackLists(usize),
 
     /// Add the top two values
     Add,
@@ -121,11 +145,14 @@ pub enum Instruction<'source> {
     /// Performs a containment check
     In,
 
+    /// Performs a comparison and preserves the right operand for chained comparisons.
+    CompareAndPreserve(CompareOp),
+
     /// Apply a filter.
-    ApplyFilter(&'source str, usize, LocalId),
+    ApplyFilter(&'source str, Option<u16>, LocalId),
 
     /// Perform a filter.
-    PerformTest(&'source str, usize, LocalId),
+    PerformTest(&'source str, Option<u16>, LocalId),
 
     /// Emit the stack top as output
     Emit,
@@ -142,7 +169,7 @@ pub enum Instruction<'source> {
     ///
     /// The argument is the jump target for when the loop
     /// ends and must point to a `PopFrame` instruction.
-    Iterate(usize),
+    Iterate(u32),
 
     /// Push a bool that indicates that the loop iterated.
     PushDidNotIterate,
@@ -150,17 +177,20 @@ pub enum Instruction<'source> {
     /// Pops the topmost frame
     PopFrame,
 
+    /// Pops the topmost frame and runs loop logic
+    PopLoopFrame,
+
     /// Jump to a specific instruction
-    Jump(usize),
+    Jump(u32),
 
     /// Jump if the stack top evaluates to false
-    JumpIfFalse(usize),
+    JumpIfFalse(u32),
 
     /// Jump if the stack top evaluates to false or pops the value
-    JumpIfFalseOrPop(usize),
+    JumpIfFalseOrPop(u32),
 
     /// Jump if the stack top evaluates to true or pops the value
-    JumpIfTrueOrPop(usize),
+    JumpIfTrueOrPop(u32),
 
     /// Sets the auto escape flag to the current value.
     PushAutoEscape,
@@ -175,13 +205,13 @@ pub enum Instruction<'source> {
     EndCapture,
 
     /// Calls a global function
-    CallFunction(&'source str, usize),
+    CallFunction(&'source str, Option<u16>),
 
     /// Calls a method
-    CallMethod(&'source str, usize),
+    CallMethod(&'source str, Option<u16>),
 
     /// Calls an object
-    CallObject(usize),
+    CallObject(Option<u16>),
 
     /// Duplicates the top item
     DupTop,
@@ -190,6 +220,7 @@ pub enum Instruction<'source> {
     DiscardTop,
 
     /// A fast super instruction without intermediate capturing.
+    #[cfg(feature = "multi_template")]
     FastSuper,
 
     /// A fast loop recurse instruction without intermediate capturing.
@@ -216,7 +247,7 @@ pub enum Instruction<'source> {
 
     /// Builds a macro on the stack.
     #[cfg(feature = "macros")]
-    BuildMacro(&'source str, usize, u8),
+    BuildMacro(&'source str, u32, u8),
 
     /// Breaks from the interpreter loop (exists a function)
     #[cfg(feature = "macros")]
@@ -238,14 +269,14 @@ pub enum Instruction<'source> {
 #[derive(Copy, Clone)]
 struct LineInfo {
     first_instruction: u32,
-    line: u32,
+    line: u16,
 }
 
 #[cfg(feature = "debug")]
 #[derive(Copy, Clone)]
 struct SpanInfo {
     first_instruction: u32,
-    span: Option<Span>,
+    span: Span,
 }
 
 /// Wrapper around instructions to help with location management.
@@ -256,6 +287,8 @@ pub struct Instructions<'source> {
     span_infos: Vec<SpanInfo>,
     name: &'source str,
     source: &'source str,
+    #[cfg(feature = "multi_template")]
+    required_block: bool,
 }
 
 pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
@@ -265,18 +298,22 @@ pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
     span_infos: Vec::new(),
     name: "<unknown>",
     source: "",
+    #[cfg(feature = "multi_template")]
+    required_block: false,
 };
 
 impl<'source> Instructions<'source> {
     /// Creates a new instructions object.
     pub fn new(name: &'source str, source: &'source str) -> Instructions<'source> {
         Instructions {
-            instructions: Vec::with_capacity(128),
+            instructions: Vec::with_capacity(256),
             line_infos: Vec::with_capacity(128),
             #[cfg(feature = "debug")]
             span_infos: Vec::with_capacity(128),
             name,
             source,
+            #[cfg(feature = "multi_template")]
+            required_block: false,
         }
     }
 
@@ -292,47 +329,61 @@ impl<'source> Instructions<'source> {
 
     /// Returns an instruction by index
     #[inline(always)]
-    pub fn get(&self, idx: usize) -> Option<&Instruction<'source>> {
-        self.instructions.get(idx)
+    pub fn get(&self, idx: u32) -> Option<&Instruction<'source>> {
+        self.instructions.get(idx as usize)
     }
 
     /// Returns an instruction by index mutably
-    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Instruction<'source>> {
-        self.instructions.get_mut(idx)
+    pub fn get_mut(&mut self, idx: u32) -> Option<&mut Instruction<'source>> {
+        self.instructions.get_mut(idx as usize)
     }
 
     /// Adds a new instruction
-    pub fn add(&mut self, instr: Instruction<'source>) -> usize {
+    pub fn add(&mut self, instr: Instruction<'source>) -> u32 {
         let rv = self.instructions.len();
         self.instructions.push(instr);
-        rv
+        rv as u32
     }
 
-    fn add_line_record(&mut self, instr: usize, line: u32) {
+    #[cfg(feature = "multi_template")]
+    pub(crate) fn mark_required_block(&mut self, required: bool) {
+        self.required_block = required;
+    }
+
+    #[cfg(feature = "multi_template")]
+    pub(crate) fn is_required_block(&self) -> bool {
+        self.required_block
+    }
+
+    fn add_line_record(&mut self, instr: u32, line: u16) {
         let same_loc = self
             .line_infos
             .last()
-            .map_or(false, |last_loc| last_loc.line == line);
+            .is_some_and(|last_loc| last_loc.line == line);
         if !same_loc {
             self.line_infos.push(LineInfo {
-                first_instruction: instr as u32,
+                first_instruction: instr,
                 line,
             });
         }
     }
 
     /// Adds a new instruction with line number.
-    pub fn add_with_line(&mut self, instr: Instruction<'source>, line: u32) -> usize {
+    pub fn add_with_line(&mut self, instr: Instruction<'source>, line: u16) -> u32 {
         let rv = self.add(instr);
         self.add_line_record(rv, line);
 
         // if we follow up to a valid span with no more span, clear it out
         #[cfg(feature = "debug")]
         {
-            if self.span_infos.last().map_or(false, |x| x.span.is_some()) {
+            if self
+                .span_infos
+                .last()
+                .is_some_and(|x| x.span != Span::default())
+            {
                 self.span_infos.push(SpanInfo {
-                    first_instruction: rv as u32,
-                    span: None,
+                    first_instruction: rv,
+                    span: Span::default(),
                 });
             }
         }
@@ -340,18 +391,18 @@ impl<'source> Instructions<'source> {
     }
 
     /// Adds a new instruction with span.
-    pub fn add_with_span(&mut self, instr: Instruction<'source>, span: Span) -> usize {
+    pub fn add_with_span(&mut self, instr: Instruction<'source>, span: Span) -> u32 {
         let rv = self.add(instr);
         #[cfg(feature = "debug")]
         {
             let same_loc = self
                 .span_infos
                 .last()
-                .map_or(false, |last_loc| last_loc.span == Some(span));
+                .is_some_and(|last_loc| last_loc.span == span);
             if !same_loc {
                 self.span_infos.push(SpanInfo {
-                    first_instruction: rv as u32,
-                    span: Some(span),
+                    first_instruction: rv,
+                    span,
                 });
             }
         }
@@ -360,10 +411,10 @@ impl<'source> Instructions<'source> {
     }
 
     /// Looks up the line for an instruction
-    pub fn get_line(&self, idx: usize) -> Option<usize> {
+    pub fn get_line(&self, idx: u32) -> Option<usize> {
         let loc = match self
             .line_infos
-            .binary_search_by_key(&idx, |x| x.first_instruction as usize)
+            .binary_search_by_key(&idx, |x| x.first_instruction)
         {
             Ok(idx) => &self.line_infos[idx],
             Err(0) => return None,
@@ -373,18 +424,18 @@ impl<'source> Instructions<'source> {
     }
 
     /// Looks up a span for an instruction.
-    pub fn get_span(&self, idx: usize) -> Option<Span> {
+    pub fn get_span(&self, idx: u32) -> Option<Span> {
         #[cfg(feature = "debug")]
         {
             let loc = match self
                 .span_infos
-                .binary_search_by_key(&idx, |x| x.first_instruction as usize)
+                .binary_search_by_key(&idx, |x| x.first_instruction)
             {
                 Ok(idx) => &self.span_infos[idx],
                 Err(0) => return None,
                 Err(idx) => &self.span_infos[idx - 1],
             };
-            loc.span
+            (loc.span != Span::default()).then_some(loc.span)
         }
         #[cfg(not(feature = "debug"))]
         {
@@ -396,13 +447,13 @@ impl<'source> Instructions<'source> {
     /// Returns a list of all names referenced in the current block backwards
     /// from the given pc.
     #[cfg(feature = "debug")]
-    pub fn get_referenced_names(&self, idx: usize) -> Vec<&'source str> {
+    pub fn get_referenced_names(&self, idx: u32) -> Vec<&'source str> {
         let mut rv = Vec::new();
         // make sure we don't crash on empty instructions
         if self.instructions.is_empty() {
             return rv;
         }
-        let idx = idx.min(self.instructions.len() - 1);
+        let idx = (idx as usize).min(self.instructions.len() - 1);
         for instr in self.instructions[..=idx].iter().rev() {
             let name = match instr {
                 Instruction::Lookup(name)
@@ -419,24 +470,17 @@ impl<'source> Instructions<'source> {
         rv
     }
 
-    /// Returns the number of instructions
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.instructions.len()
-    }
-
-    /// Do we have any instructions?
-    #[allow(unused)]
-    pub fn is_empty(&self) -> bool {
-        self.instructions.is_empty()
     }
 }
 
 #[cfg(feature = "internal_debug")]
-impl<'source> fmt::Debug for Instructions<'source> {
+impl fmt::Debug for Instructions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct InstructionWrapper<'a>(usize, &'a Instruction<'a>, Option<usize>);
 
-        impl<'a> fmt::Debug for InstructionWrapper<'a> {
+        impl fmt::Debug for InstructionWrapper<'_> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 ok!(write!(f, "{:>05} | {:?}", self.0, self.1,));
                 if let Some(line) = self.2 {
@@ -449,7 +493,7 @@ impl<'source> fmt::Debug for Instructions<'source> {
         let mut list = f.debug_list();
         let mut last_line = None;
         for (idx, instr) in self.instructions.iter().enumerate() {
-            let line = self.get_line(idx);
+            let line = self.get_line(idx as u32);
             list.entry(&InstructionWrapper(
                 idx,
                 instr,

@@ -13,10 +13,26 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
       - name: Check
         run: make check
       - name: Test
         run: make test
+
+  test-cabi:
+    name: Test C ABI C library
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: make -C minijinja-cabi test
 
   test-nightly:
     name: Test on nightly
@@ -28,20 +44,24 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
+      - name: Wipe Cargo.lock
+        run: rm Cargo.lock
       - name: Check
         run: make check
       - name: Test
-        run: make test
+        run: make test-rust
+      - name: -Znext-solver
+        run: RUSTFLAGS="-Znext-solver" cargo check --all --all-features
 
   test-32bit:
-    name: Check on 1.61.0 (32bit)
+    name: Check on 1.70.0 (32bit)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.61.0
+          toolchain: 1.70.0
           targets: armv5te-unknown-linux-gnueabi
       - uses: Swatinem/rust-cache@v2
       - name: Install Cross Deps
@@ -54,14 +74,14 @@ jobs:
         run: cargo check --all-features -p minijinja --target armv5te-unknown-linux-gnueabi
 
   test-fuel-feature:
-    name: Check on 1.61.0 (fuel feature)
+    name: Check on 1.70.0 (fuel feature)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.61.0
+          toolchain: 1.70.0
       - uses: Swatinem/rust-cache@v2
       - name: Restore Cargo.lock
         run: cp Cargo.lock.msrv Cargo.lock
@@ -69,14 +89,14 @@ jobs:
         run: cargo check --no-default-features -p minijinja --features fuel
 
   test-stable:
-    name: Test on 1.61.0
+    name: Test on 1.70.0
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.61.0
+          toolchain: 1.70.0
       - uses: Swatinem/rust-cache@v2
       - name: Restore Cargo.lock
         run: cp Cargo.lock.msrv Cargo.lock
@@ -96,7 +116,7 @@ jobs:
       - name: Remove Cargo.lock
         run: rm Cargo.lock
       - name: Test
-        run: make test
+        run: make test-rust
 
   test-wasi:
     name: Test on WASI
@@ -107,18 +127,45 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          targets: wasm32-wasi
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Install WasmTime
-        run: |
-          curl -LO https://github.com/bytecodealliance/wasmtime/releases/download/v13.0.0/wasmtime-v13.0.0-x86_64-linux.tar.xz
-          tar xvf wasmtime-v13.0.0-x86_64-linux.tar.xz
-          echo `pwd`/wasmtime-v13.0.0-x86_64-linux >> $GITHUB_PATH
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          version: "13.0.0"
       - name: Test
         run: make wasi-test
 
   test-python:
-    name: Test on Python binding
+    name: Test Python binding (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, freethreaded]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v3
+        if: matrix.variant == 'freethreaded'
+      - name: Install free-threaded Python
+        if: matrix.variant == 'freethreaded'
+        run: |
+          set -euo pipefail
+          TARGET=cpython-3.14.0+freethreaded-linux-x86_64-gnu
+          uv python install "$TARGET"
+          PYTHON_BIN=$(uv python find "$TARGET")
+          echo "$(dirname "$PYTHON_BIN")" >> "$GITHUB_PATH"
+          "$PYTHON_BIN" -c "import sys; print('Free threading:', not sys._is_gil_enabled())"
+      - name: Test
+        run: make python-test
+
+  test-js:
+    name: Test JS binding
     runs-on: ubuntu-latest
 
     steps:
@@ -127,8 +174,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install wasm-pack
+        run: |
+          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
       - name: Test
-        run: make python-test
+        run: make js-test
   
   test-cli-linux:
     name: Test CLI Linux

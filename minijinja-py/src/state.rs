@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::environment::{with_environment, Environment};
-use crate::typeconv::to_python_value;
+use crate::typeconv::{to_minijinja_value, to_python_value};
 
 thread_local! {
     static CURRENT_STATE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
@@ -19,8 +19,8 @@ pub struct StateRef;
 impl StateRef {
     /// Returns a reference to the environment.
     #[getter]
-    pub fn get_env(&self) -> PyResult<Py<Environment>> {
-        with_environment(Ok)
+    pub fn get_env(&self, py: Python<'_>) -> PyResult<Py<Environment>> {
+        with_environment(py, Ok)
     }
 
     /// Returns the name of the template.
@@ -56,14 +56,45 @@ impl StateRef {
             state
                 .lookup(name)
                 .map(to_python_value)
-                .unwrap_or_else(|| Ok(Python::with_gil(|py| py.None())))
+                .unwrap_or_else(|| Ok(Python::attach(|py| py.None())))
+        })
+    }
+
+    /// Looks up a temp by name.
+    #[pyo3(signature = (name, default = None))]
+    pub fn get_temp(&self, name: &str, default: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        with_state(|state| {
+            let rv = state.get_temp(name);
+            match rv {
+                Some(rv) => to_python_value(rv),
+                None => {
+                    if let Some(default) = default {
+                        let val = to_minijinja_value(default);
+                        state.set_temp(name, val.clone());
+                        to_python_value(val)
+                    } else {
+                        Ok(Python::attach(|py| py.None()))
+                    }
+                }
+            }
+        })
+    }
+
+    /// Sets a temp by name and returns the old value.
+    #[pyo3(text_signature = "(self, name, value)")]
+    pub fn set_temp(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        with_state(|state| {
+            state
+                .set_temp(name, to_minijinja_value(value))
+                .map(to_python_value)
+                .unwrap_or_else(|| Ok(Python::attach(|py| py.None())))
         })
     }
 }
 
-pub fn with_state<R, F: FnOnce(&State) -> PyResult<R>>(f: F) -> PyResult<R> {
+pub fn with_state<R, F: FnOnce(&mut State) -> PyResult<R>>(f: F) -> PyResult<R> {
     CURRENT_STATE.with(|handle| {
-        match unsafe { (handle.load(Ordering::Relaxed) as *const State).as_ref() } {
+        match unsafe { (handle.load(Ordering::Relaxed) as *mut State).as_mut() } {
             Some(state) => f(state),
             None => Err(PyRuntimeError::new_err(
                 "state cannot be used outside of template render",
@@ -73,9 +104,9 @@ pub fn with_state<R, F: FnOnce(&State) -> PyResult<R>>(f: F) -> PyResult<R> {
 }
 
 /// Invokes a function with the state stashed away.
-pub fn bind_state<R, F: FnOnce() -> R>(state: &State, f: F) -> R {
-    let old_handle = CURRENT_STATE
-        .with(|handle| handle.swap(state as *const _ as *mut c_void, Ordering::Relaxed));
+pub fn bind_state<R, F: FnOnce() -> R>(state: &mut State, f: F) -> R {
+    let old_handle =
+        CURRENT_STATE.with(|handle| handle.swap(state as *mut _ as *mut c_void, Ordering::Relaxed));
     let rv = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     CURRENT_STATE.with(|handle| handle.store(old_handle, Ordering::Relaxed));
     match rv {

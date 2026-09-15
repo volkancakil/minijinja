@@ -23,7 +23,7 @@ impl Site {
 impl Object for Site {
     fn call_method(
         self: &Arc<Self>,
-        _state: &State<'_, '_>,
+        _state: &mut State<'_, '_>,
         method: &str,
         args: &[Value],
     ) -> Result<Value, Error> {
@@ -46,5 +46,5 @@ async fn main() {
     let rv = spawn_blocking(move || render!("title: {{ site.get_config('title') }}", site))
         .await
         .unwrap();
-    println!("{}", rv);
+    println!("{rv}");
 }

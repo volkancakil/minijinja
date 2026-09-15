@@ -1,9 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
-
-use serde::Serialize;
+use std::sync::{Arc, OnceLock};
 
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::instructions::Instructions;
@@ -11,21 +9,44 @@ use crate::compiler::parser::parse_expr;
 use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
 use crate::output::Output;
-use crate::template::{CompiledTemplate, CompiledTemplateRef, Template, TemplateConfig};
-use crate::utils::{AutoEscape, BTreeMapKeysDebug, UndefinedBehavior};
-use crate::value::{FunctionArgs, FunctionResult, Value};
+use crate::template::{
+    AutoEscapeFunc, CompiledTemplate, CompiledTemplateRef, Template, TemplateConfig,
+};
+use crate::utils::{write_escaped, AutoEscape, BTreeMapKeysDebug, UndefinedBehavior};
+use crate::value::{FunctionArgs, FunctionResult, UndefinedType, Value, ValueRepr};
 use crate::vm::State;
-use crate::{defaults, filters, functions, tests};
+use crate::{defaults, functions};
 
-type FormatterFunc = dyn Fn(&mut Output, &State, &Value) -> Result<(), Error> + Sync + Send;
+type FormatterFunc = dyn Fn(&mut Output, &mut State, &Value) -> Result<(), Error> + Sync + Send;
 type PathJoinFunc = dyn for<'s> Fn(&'s str, &'s str) -> Cow<'s, str> + Sync + Send;
 type UnknownMethodFunc =
-    dyn Fn(&State, &Value, &str, &[Value]) -> Result<Value, Error> + Sync + Send;
+    dyn Fn(&mut State, &Value, &str, &[Value]) -> Result<Value, Error> + Sync + Send;
+
+fn default_auto_escape_callback() -> Arc<AutoEscapeFunc> {
+    static DEFAULT_AUTO_ESCAPE: OnceLock<Arc<AutoEscapeFunc>> = OnceLock::new();
+    DEFAULT_AUTO_ESCAPE
+        .get_or_init(|| Arc::new(defaults::default_auto_escape_callback))
+        .clone()
+}
+
+fn no_auto_escape_callback() -> Arc<AutoEscapeFunc> {
+    static NO_AUTO_ESCAPE: OnceLock<Arc<AutoEscapeFunc>> = OnceLock::new();
+    NO_AUTO_ESCAPE
+        .get_or_init(|| Arc::new(defaults::no_auto_escape))
+        .clone()
+}
+
+fn default_formatter() -> Arc<FormatterFunc> {
+    static FORMATTER: OnceLock<Arc<FormatterFunc>> = OnceLock::new();
+    FORMATTER
+        .get_or_init(|| Arc::new(defaults::escape_formatter))
+        .clone()
+}
 
 /// The maximum recursion in the VM.  Normally each stack frame
-/// adds one to this counter (eg: every time a frame is added).
+/// adds one to this counter (e.g., every time a frame is added).
 /// However in some situations more depth is pushed if the cost
-/// of the stack frame is higher.  Raising this above this limit
+/// of the stack frame is higher.  Raising this limit
 /// requires enabling the `stacker` feature.
 const MAX_RECURSION: usize = 500;
 
@@ -47,13 +68,14 @@ const MAX_RECURSION: usize = 500;
 #[derive(Clone)]
 pub struct Environment<'source> {
     templates: TemplateStore<'source>,
-    filters: BTreeMap<Cow<'source, str>, filters::BoxedFilter>,
-    tests: BTreeMap<Cow<'source, str>, tests::BoxedTest>,
-    globals: BTreeMap<Cow<'source, str>, Value>,
+    filters: Arc<BTreeMap<Cow<'source, str>, Value>>,
+    tests: Arc<BTreeMap<Cow<'source, str>, Value>>,
+    globals: Arc<BTreeMap<Cow<'source, str>, Value>>,
     path_join_callback: Option<Arc<PathJoinFunc>>,
     pub(crate) unknown_method_callback: Option<Arc<UnknownMethodFunc>>,
     undefined_behavior: UndefinedBehavior,
     formatter: Arc<FormatterFunc>,
+    formatter_is_default: bool,
     #[cfg(feature = "debug")]
     debug: bool,
     #[cfg(feature = "fuel")]
@@ -61,13 +83,13 @@ pub struct Environment<'source> {
     recursion_limit: usize,
 }
 
-impl<'source> Default for Environment<'source> {
+impl Default for Environment<'_> {
     fn default() -> Self {
         Environment::empty()
     }
 }
 
-impl<'source> fmt::Debug for Environment<'source> {
+impl fmt::Debug for Environment<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Environment")
             .field("globals", &self.globals)
@@ -87,16 +109,15 @@ impl<'source> Environment<'source> {
     /// [`empty`](Environment::empty) method.
     pub fn new() -> Environment<'source> {
         Environment {
-            templates: TemplateStore::new(TemplateConfig::new(Arc::new(
-                defaults::default_auto_escape_callback,
-            ))),
+            templates: TemplateStore::new(TemplateConfig::new(default_auto_escape_callback())),
             filters: defaults::get_builtin_filters(),
             tests: defaults::get_builtin_tests(),
             globals: defaults::get_globals(),
             path_join_callback: None,
             unknown_method_callback: None,
             undefined_behavior: UndefinedBehavior::default(),
-            formatter: Arc::new(defaults::escape_formatter),
+            formatter: default_formatter(),
+            formatter_is_default: true,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -111,14 +132,15 @@ impl<'source> Environment<'source> {
     /// logic for auto escaping configured.
     pub fn empty() -> Environment<'source> {
         Environment {
-            templates: TemplateStore::new(TemplateConfig::new(Arc::new(defaults::no_auto_escape))),
+            templates: TemplateStore::new(TemplateConfig::new(no_auto_escape_callback())),
             filters: Default::default(),
             tests: Default::default(),
             globals: Default::default(),
             path_join_callback: None,
             unknown_method_callback: None,
             undefined_behavior: UndefinedBehavior::default(),
-            formatter: Arc::new(defaults::escape_formatter),
+            formatter: default_formatter(),
+            formatter_is_default: true,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -138,14 +160,12 @@ impl<'source> Environment<'source> {
     /// let mut env = Environment::new();
     /// env.add_template("index.html", "Hello {{ name }}!").unwrap();
     /// ```
+    /// This method fails if the template has a syntax error.
     ///
     /// Note that there are situations where the interface of this method is
     /// too restrictive as you need to hold on to the strings for the lifetime
-    /// of the environment.
-    #[cfg_attr(
-        feature = "loader",
-        doc = "To address this restriction use [`add_template_owned`](Self::add_template_owned)."
-    )]
+    /// of the environment. To avoid this restriction use
+    /// [`add_template_owned`](Self::add_template_owned).
     pub fn add_template(&mut self, name: &'source str, source: &'source str) -> Result<(), Error> {
         self.templates.insert(name, source)
     }
@@ -161,10 +181,9 @@ impl<'source> Environment<'source> {
     /// env.add_template_owned("index.html".to_string(), "Hello {{ name }}!".to_string()).unwrap();
     /// ```
     ///
-    /// **Note**: the name is a bit of a misnomer as this API also allows to borrow too as
-    /// the parameters are actually [`Cow`].
-    #[cfg(feature = "loader")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
+    /// **Note**: the name is a bit of a misnomer as this API also allows borrowing,
+    /// as the parameters are actually [`Cow`].  This method fails if the template
+    /// has a syntax error.
     pub fn add_template_owned<N, S>(&mut self, name: N, source: S) -> Result<(), Error>
     where
         N: Into<Cow<'source, str>>,
@@ -201,8 +220,6 @@ impl<'source> Environment<'source> {
     ///     env
     /// }
     /// ```
-    #[cfg(feature = "loader")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
     pub fn set_loader<F>(&mut self, f: F)
     where
         F: Fn(&str) -> Result<Option<String>, Error> + Send + Sync + 'static,
@@ -323,7 +340,7 @@ impl<'source> Environment<'source> {
     /// see [minijinja_contrib::pycompat](https://docs.rs/minijinja-contrib/latest/minijinja_contrib/pycompat/).
     pub fn set_unknown_method_callback<F>(&mut self, f: F)
     where
-        F: Fn(&State, &Value, &str, &[Value]) -> Result<Value, Error> + Sync + Send + 'static,
+        F: Fn(&mut State, &Value, &str, &[Value]) -> Result<Value, Error> + Sync + Send + 'static,
     {
         self.unknown_method_callback = Some(Arc::new(f));
     }
@@ -380,8 +397,7 @@ impl<'source> Environment<'source> {
 
     /// Loads a template from a string.
     ///
-    /// In some cases you really only need to work with (eg: render) a template to be
-    /// rendered once only.
+    /// In some cases you only need to work with (e.g., render) a template once.
     ///
     /// ```
     /// # use minijinja::{Environment, context};
@@ -431,13 +447,11 @@ impl<'source> Environment<'source> {
     /// println!("{}", rv.unwrap());
     /// ```
     ///
-    /// **Note on values:** The [`Value`] type implements `Serialize` and can be
-    /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render_named_str<S: Serialize>(
+    pub fn render_named_str<V: Into<Value>>(
         &self,
         name: &str,
         source: &str,
-        ctx: S,
+        ctx: V,
     ) -> Result<String, Error> {
         ok!(self.template_from_named_str(name, source)).render(ctx)
     }
@@ -450,9 +464,7 @@ impl<'source> Environment<'source> {
     /// This is an alias for [`template_from_str`](Self::template_from_str) paired with
     /// [`render`](Template::render).
     ///
-    /// **Note on values:** The [`Value`] type implements `Serialize` and can be
-    /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render_str<S: Serialize>(&self, source: &str, ctx: S) -> Result<String, Error> {
+    pub fn render_str<V: Into<Value>>(&self, source: &str, ctx: V) -> Result<String, Error> {
         // reduce total amount of code falling under mono morphization into
         // this function, and share the rest in _eval.
         ok!(self.template_from_str(source)).render(ctx)
@@ -465,7 +477,7 @@ impl<'source> Environment<'source> {
     /// invoked with the name of the template and can make an initial auto
     /// escaping decision based on that.  The default implementation
     /// ([`default_auto_escape_callback`](defaults::default_auto_escape_callback))
-    /// turn on escaping depending on the file extension.
+    /// turns on escaping depending on the file extension.
     ///
     /// ```
     /// # use minijinja::{Environment, AutoEscape};
@@ -539,9 +551,10 @@ impl<'source> Environment<'source> {
     /// ```
     pub fn set_formatter<F>(&mut self, f: F)
     where
-        F: Fn(&mut Output, &State, &Value) -> Result<(), Error> + 'static + Sync + Send,
+        F: Fn(&mut Output, &mut State, &Value) -> Result<(), Error> + 'static + Sync + Send,
     {
         self.formatter = Arc::new(f);
+        self.formatter_is_default = false;
     }
 
     /// Enable or disable the debug mode.
@@ -647,9 +660,9 @@ impl<'source> Environment<'source> {
 
     /// Compiles an expression.
     ///
-    /// This lets one compile an expression in the template language and
-    /// receive the output.  This lets one use the expressions of the language
-    /// be used as a minimal scripting language.  For more information and an
+    /// This lets you compile an expression in the template language and evaluate it.
+    /// This makes it possible to use the language's expressions as a minimal
+    /// scripting language.  For more information and an
     /// example see [`Expression`].
     pub fn compile_expression(&self, expr: &'source str) -> Result<Expression<'_, 'source>, Error> {
         self._compile_expression(expr)
@@ -660,8 +673,6 @@ impl<'source> Environment<'source> {
     ///
     /// This works exactly like [`compile_expression`](Self::compile_expression) but
     /// lets you pass an owned string without capturing the lifetime.
-    #[cfg(feature = "loader")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
     pub fn compile_expression_owned<E>(&self, expr: E) -> Result<Expression<'_, 'source>, Error>
     where
         E: Into<Cow<'source, str>>,
@@ -675,9 +686,9 @@ impl<'source> Environment<'source> {
     fn _compile_expression<'expr>(&self, expr: &'expr str) -> Result<Instructions<'expr>, Error> {
         attach_basic_debug_info(
             parse_expr(expr).map(|ast| {
-                let mut gen = CodeGenerator::new("<expression>", expr);
-                gen.compile_expr(&ast);
-                gen.finish().0
+                let mut g = CodeGenerator::new("<expression>", expr);
+                g.compile_expr(&ast);
+                g.finish().0
             }),
             expr,
         )
@@ -687,44 +698,40 @@ impl<'source> Environment<'source> {
     ///
     /// Filter functions are functions that can be applied to values in
     /// templates.  For details about filters have a look at
-    /// [`Filter`](crate::filters::Filter).
+    /// [`filters`](crate::filters).
     pub fn add_filter<N, F, Rv, Args>(&mut self, name: N, f: F)
     where
         N: Into<Cow<'source, str>>,
-        // the crazy bounds here exist to enable borrowing in closures
-        F: filters::Filter<Rv, Args>
-            + for<'a> filters::Filter<Rv, <Args as FunctionArgs<'a>>::Output>,
+        F: functions::Function<Rv, Args>,
         Rv: FunctionResult,
         Args: for<'a> FunctionArgs<'a>,
     {
-        self.filters
-            .insert(name.into(), filters::BoxedFilter::new(f));
+        Arc::make_mut(&mut self.filters).insert(name.into(), Value::from_function(f));
     }
 
     /// Removes a filter by name.
     pub fn remove_filter(&mut self, name: &str) {
-        self.filters.remove(name);
+        Arc::make_mut(&mut self.filters).remove(name);
     }
 
     /// Adds a new test function.
     ///
     /// Test functions are similar to filters but perform a check on a value
     /// where the return value is always true or false.  For details about tests
-    /// have a look at [`Test`](crate::tests::Test).
+    /// have a look at [`tests`](crate::tests).
     pub fn add_test<N, F, Rv, Args>(&mut self, name: N, f: F)
     where
         N: Into<Cow<'source, str>>,
-        // the crazy bounds here exist to enable borrowing in closures
-        F: tests::Test<Rv, Args> + for<'a> tests::Test<Rv, <Args as FunctionArgs<'a>>::Output>,
-        Rv: tests::TestResult,
+        F: functions::Function<Rv, Args>,
+        Rv: FunctionResult,
         Args: for<'a> FunctionArgs<'a>,
     {
-        self.tests.insert(name.into(), tests::BoxedTest::new(f));
+        Arc::make_mut(&mut self.tests).insert(name.into(), Value::from_function(f));
     }
 
     /// Removes a test by name.
     pub fn remove_test(&mut self, name: &str) {
-        self.tests.remove(name);
+        Arc::make_mut(&mut self.tests).remove(name);
     }
 
     /// Adds a new global function.
@@ -733,12 +740,13 @@ impl<'source> Environment<'source> {
     /// functions and other global variables share the same namespace.
     /// For more details about functions have a look at
     /// [`Function`](crate::functions::Function).
+    ///
+    /// This is a shortcut for calling [`add_global`](Self::add_global) with the
+    /// function wrapped with [`Value::from_function`].
     pub fn add_function<N, F, Rv, Args>(&mut self, name: N, f: F)
     where
         N: Into<Cow<'source, str>>,
-        // the crazy bounds here exist to enable borrowing in closures
-        F: functions::Function<Rv, Args>
-            + for<'a> functions::Function<Rv, <Args as FunctionArgs<'a>>::Output>,
+        F: functions::Function<Rv, Args>,
         Rv: FunctionResult,
         Args: for<'a> FunctionArgs<'a>,
     {
@@ -751,12 +759,19 @@ impl<'source> Environment<'source> {
         N: Into<Cow<'source, str>>,
         V: Into<Value>,
     {
-        self.globals.insert(name.into(), value.into());
+        Arc::make_mut(&mut self.globals).insert(name.into(), value.into());
     }
 
     /// Removes a global function or variable by name.
     pub fn remove_global(&mut self, name: &str) {
-        self.globals.remove(name);
+        Arc::make_mut(&mut self.globals).remove(name);
+    }
+
+    /// Returns an iterator of all global variables.
+    pub fn globals(&self) -> impl Iterator<Item = (&str, Value)> {
+        self.globals
+            .iter()
+            .map(|(key, value)| (key as &str, value.clone()))
     }
 
     /// Returns an empty [`State`] for testing purposes and similar.
@@ -764,23 +779,28 @@ impl<'source> Environment<'source> {
         State::new_for_env(self)
     }
 
-    /// Looks up a function.
+    /// Looks up a global.
     pub(crate) fn get_global(&self, name: &str) -> Option<Value> {
         self.globals.get(name).cloned()
     }
 
     /// Looks up a filter.
-    pub(crate) fn get_filter(&self, name: &str) -> Option<&filters::BoxedFilter> {
+    pub(crate) fn get_filter(&self, name: &str) -> Option<&Value> {
         self.filters.get(name)
     }
 
     /// Looks up a test function.
-    pub(crate) fn get_test(&self, name: &str) -> Option<&tests::BoxedTest> {
+    pub(crate) fn get_test(&self, name: &str) -> Option<&Value> {
         self.tests.get(name)
     }
 
     pub(crate) fn initial_auto_escape(&self, name: &str) -> AutoEscape {
         (self.templates.template_config.default_auto_escape)(name)
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_default_formatter(&self) -> bool {
+        self.formatter_is_default
     }
 
     /// Formats a value into the final format.
@@ -791,13 +811,24 @@ impl<'source> Environment<'source> {
     pub(crate) fn format(
         &self,
         value: &Value,
-        state: &State,
+        state: &mut State,
         out: &mut Output,
     ) -> Result<(), Error> {
-        if value.is_undefined() && matches!(self.undefined_behavior, UndefinedBehavior::Strict) {
-            Err(Error::from(ErrorKind::UndefinedError))
-        } else {
-            (self.formatter)(out, state, value)
+        match (self.undefined_behavior, &value.0) {
+            // this intentionally does not check for SilentUndefined.  SilentUndefined is
+            // exclusively used in the missing else condition of an if expression to match
+            // Jinja2 behavior.  Those go straight to the formatter.
+            (
+                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                &ValueRepr::Undefined(UndefinedType::Default),
+            ) => Err(Error::from(ErrorKind::UndefinedError)),
+            _ => {
+                if self.formatter_is_default {
+                    write_escaped(out, state.auto_escape(), value)
+                } else {
+                    (self.formatter)(out, state, value)
+                }
+            }
         }
     }
 
@@ -810,65 +841,4 @@ impl<'source> Environment<'source> {
     }
 }
 
-#[cfg(not(feature = "loader"))]
-mod basic_store {
-    use super::*;
-
-    #[derive(Clone)]
-    pub(crate) struct BasicStore<'source> {
-        pub template_config: TemplateConfig,
-        map: BTreeMap<&'source str, Arc<CompiledTemplate<'source>>>,
-    }
-
-    impl<'source> fmt::Debug for BasicStore<'source> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            BTreeMapKeysDebug(&self.map).fmt(f)
-        }
-    }
-
-    impl<'source> BasicStore<'source> {
-        pub fn new(template_config: TemplateConfig) -> BasicStore<'source> {
-            BasicStore {
-                template_config,
-                map: BTreeMap::default(),
-            }
-        }
-
-        pub fn insert(&mut self, name: &'source str, source: &'source str) -> Result<(), Error> {
-            self.map.insert(
-                name,
-                Arc::new(ok!(CompiledTemplate::new(
-                    name,
-                    source,
-                    &self.template_config
-                ))),
-            );
-            Ok(())
-        }
-
-        pub fn remove(&mut self, name: &str) {
-            self.map.remove(name);
-        }
-
-        pub fn clear(&mut self) {
-            self.map.clear();
-        }
-
-        pub fn get(&self, name: &str) -> Result<&CompiledTemplate<'source>, Error> {
-            self.map
-                .get(name)
-                .map(|x| &**x)
-                .ok_or_else(|| Error::new_not_found(name))
-        }
-
-        pub fn iter(&self) -> impl Iterator<Item = (&str, &CompiledTemplate<'source>)> {
-            self.map.iter().map(|(name, template)| (*name, &**template))
-        }
-    }
-}
-
-#[cfg(not(feature = "loader"))]
-use self::basic_store::BasicStore as TemplateStore;
-
-#[cfg(feature = "loader")]
 use crate::loader::LoaderStore as TemplateStore;

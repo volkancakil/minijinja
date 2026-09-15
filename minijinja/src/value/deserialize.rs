@@ -1,13 +1,11 @@
-use std::ops::{Deref, DerefMut};
-
 use serde::de::value::{MapDeserializer, SeqDeserializer};
 use serde::de::{
-    self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess,
-    SeqAccess, Unexpected, VariantAccess, Visitor,
+    self, Deserialize, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess,
+    IntoDeserializer, MapAccess, SeqAccess, Unexpected, VariantAccess, Visitor,
 };
 use serde::forward_to_deserialize_any;
 
-use crate::value::{ArgType, ObjectRepr, Value, ValueKind, ValueMap, ValueRepr};
+use crate::value::{ArgType, ObjectRepr, Serde, Value, ValueKind, ValueMap, ValueRepr};
 use crate::{Error, ErrorKind};
 
 #[cfg_attr(docsrs, doc(cfg(feature = "deserialization")))]
@@ -88,52 +86,22 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 }
 
-/// Utility type to deserialize an argument.
-///
-/// This allows you to directly accept a type that implements [`Deserialize`] as an
-/// argument to a filter or test.  The type dereferences into the inner type and
-/// it also lets you move out the inner type.
-///
-/// ```rust
-/// # use minijinja::Environment;
-/// use std::path::PathBuf;
-/// use minijinja::value::ViaDeserialize;
-///
-/// fn dirname(path: ViaDeserialize<PathBuf>) -> String {
-///     match path.parent() {
-///         Some(parent) => parent.display().to_string(),
-///         None => "".to_string()
-///     }
-/// }
-///
-/// # let mut env = Environment::new();
-/// env.add_filter("dirname", dirname);
-/// ```
-#[cfg_attr(docsrs, doc(cfg(feature = "deserialization")))]
-pub struct ViaDeserialize<T>(pub T);
-
-impl<'a, T: Deserialize<'a>> ArgType<'a> for ViaDeserialize<T> {
+impl<'a, T: DeserializeOwned> ArgType<'a> for Serde<T> {
     type Output = Self;
 
     fn from_value(value: Option<&'a Value>) -> Result<Self, Error> {
         match value {
-            Some(value) => T::deserialize(value).map(ViaDeserialize),
+            Some(value) => {
+                if value.is_kwargs() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "cannot deserialize from kwargs",
+                    ));
+                }
+                T::deserialize(value).map(Serde)
+            }
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
-    }
-}
-
-impl<T> Deref for ViaDeserialize<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for ViaDeserialize<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
     }
 }
 
@@ -150,7 +118,7 @@ macro_rules! common_forward {
 }
 
 #[cfg_attr(docsrs, doc(cfg(feature = "deserialization")))]
-impl<'de> IntoDeserializer<'de, Error> for Value {
+impl IntoDeserializer<'_, Error> for Value {
     type Deserializer = Value;
 
     fn into_deserializer(self) -> Value {
@@ -173,7 +141,7 @@ impl<'de> Deserializer<'de> for Value {
             ValueRepr::F64(v) => visitor.visit_f64(v),
             ValueRepr::String(ref v, _) => visitor.visit_str(v),
             ValueRepr::SmallStr(v) => visitor.visit_str(v.as_str()),
-            ValueRepr::Undefined | ValueRepr::None => visitor.visit_unit(),
+            ValueRepr::Undefined(_) | ValueRepr::None => visitor.visit_unit(),
             ValueRepr::Bytes(ref v) => visitor.visit_bytes(v),
             ValueRepr::Object(o) => match o.repr() {
                 ObjectRepr::Plain => Err(de::Error::custom("cannot deserialize plain objects")),
@@ -189,7 +157,7 @@ impl<'de> Deserializer<'de> for Value {
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self.0 {
-            ValueRepr::None | ValueRepr::Undefined => visitor.visit_unit(),
+            ValueRepr::None | ValueRepr::Undefined(_) => visitor.visit_unit(),
             _ => visitor.visit_some(self),
         }
     }
@@ -335,7 +303,7 @@ impl<'de> VariantAccess<'de> for VariantDeserializer {
 }
 
 #[cfg_attr(docsrs, doc(cfg(feature = "deserialization")))]
-impl<'de, 'v> Deserializer<'de> for &'v Value {
+impl<'de> Deserializer<'de> for &Value {
     type Error = Error;
 
     #[inline]
@@ -395,9 +363,9 @@ impl de::Error for Error {
     }
 }
 
-fn value_to_unexpected(value: &Value) -> Unexpected {
+fn value_to_unexpected(value: &Value) -> Unexpected<'_> {
     match value.0 {
-        ValueRepr::Undefined | ValueRepr::None => Unexpected::Unit,
+        ValueRepr::Undefined(_) | ValueRepr::None => Unexpected::Unit,
         ValueRepr::Bool(val) => Unexpected::Bool(val),
         ValueRepr::U64(val) => Unexpected::Unsigned(val),
         ValueRepr::I64(val) => Unexpected::Signed(val),

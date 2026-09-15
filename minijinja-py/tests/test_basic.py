@@ -1,10 +1,40 @@
 import binascii
 import pytest
 import posixpath
+import random
 import types
+import sys
+from functools import total_ordering
 
-from _pytest.unraisableexception import catch_unraisable_exception
-from minijinja import Environment, TemplateError, safe, pass_state, eval_expr, render_str
+from minijinja import (
+    Environment,
+    TemplateError,
+    safe,
+    pass_state,
+    eval_expr,
+    render_str,
+    load_from_path,
+)
+
+
+class catch_unraisable_exception:
+    def __init__(self) -> None:
+        self.unraisable = None
+        self._old_hook = None
+
+    def _hook(self, unraisable):
+        self.unraisable = unraisable
+
+    def __enter__(self):
+        self._old_hook = sys.unraisablehook
+        sys.unraisablehook = self._hook
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        assert self._old_hook is not None
+        sys.unraisablehook = self._old_hook
+        self._old_hook = None
+        del self.unraisable
 
 
 def test_expression():
@@ -13,6 +43,11 @@ def test_expression():
     assert rv == 43
     rv = env.eval_expr("range(n)", n=10)
     assert rv == list(range(10))
+
+
+def test_non_ascii_identifier():
+    env = Environment(templates={"t": "{{ ミニ神社 }}"})
+    assert env.render_template("t", **{"ミニ神社": "minijinja"}) == "minijinja"
 
 
 def test_pass_callable():
@@ -67,10 +102,22 @@ def test_method_calling():
 def test_types_passthrough():
     tup = (1, 2, 3)
     assert eval_expr("x", x=tup) == tup
+    assert eval_expr("(1, 2, 3)") == tup
+    assert eval_expr("[1, 2, 3]") == [1, 2, 3]
     assert render_str("{{ x }}", x=tup) == "(1, 2, 3)"
     assert eval_expr("x is sequence", x=tup) == True
     assert render_str("{{ x }}", x=(1, True)) == "(1, True)"
     assert eval_expr("x[0] == 42", x=[42]) == True
+
+
+def test_collection_rendering():
+    assert render_str("{{ [name, true, none] }}", name="World") == (
+        "['World', True, None]"
+    )
+    assert render_str("{{ (name, true) }}", name="World") == "('World', True)"
+    assert render_str("{{ value|tojson }}", value={"a": 1, "b": [2, 3]}) == (
+        '{"a": 1, "b": [2, 3]}'
+    )
 
 
 def test_custom_filter():
@@ -268,19 +315,20 @@ def test_custom_syntax():
         comment_start_string="/*",
         comment_end_string="*/",
     )
-    rv = env.render_str('[% if true %]{value}[% endif %]/* nothing */', value=42)
-    assert rv == '42'
+    rv = env.render_str("[% if true %]{value}[% endif %]/* nothing */", value=42)
+    assert rv == "42"
 
 
 def test_path_join():
     def join_path(name, parent):
         return posixpath.join(posixpath.dirname(parent), name)
+
     env = Environment(
         path_join_callback=join_path,
         templates={
             "foo/bar.txt": "{% include 'baz.txt' %}",
             "foo/baz.txt": "I am baz!",
-        }
+        },
     )
 
     with catch_unraisable_exception() as cm:
@@ -339,5 +387,177 @@ def test_custom_delimiters():
         comment_start_string="<!--",
         comment_end_string="-->",
     )
-    rv = env.render_str('<% if true %>${ value }<% endif %><!-- nothing -->', value=42)
-    assert rv == '42'
+    rv = env.render_str("<% if true %>${ value }<% endif %><!-- nothing -->", value=42)
+    assert rv == "42"
+
+
+def test_undeclared_variables():
+    env = Environment(
+        templates={
+            "foo.txt": "{{ foo }} {{ bar.x }}",
+            "bar.txt": "{{ x }}",
+        }
+    )
+
+    assert env.undeclared_variables_in_str("{{ foo }}") == {"foo"}
+    assert env.undeclared_variables_in_str("{{ foo }} {{ bar.x }}") == {"foo", "bar"}
+    assert env.undeclared_variables_in_str("{{ foo }} {{ bar.x }}", nested=True) == {
+        "foo",
+        "bar.x",
+    }
+
+    assert env.undeclared_variables_in_template("foo.txt") == {"foo", "bar"}
+    assert env.undeclared_variables_in_template("bar.txt") == {"x"}
+    assert env.undeclared_variables_in_template("foo.txt", nested=True) == {
+        "foo",
+        "bar.x",
+    }
+
+
+def test_loop_controls():
+    env = Environment()
+    rv = env.render_str(
+        """
+    {% for x in [1, 2, 3, 4, 5] %}
+      {% if x == 1 %}
+        {% continue %}
+      {% elif x == 3 %}
+        {% break %}
+      {% endif %}
+      {{ x }}
+    {% endfor %}
+    """
+    )
+    assert rv.split() == ["2"]
+
+
+def test_pass_through_sort():
+    @total_ordering
+    class X(object):
+        def __init__(self, value):
+            self.value = value
+
+        def __eq__(self, other):
+            if type(self) is not type(other):
+                return NotImplemented
+            return self.value == other.value
+
+        def __lt__(self, other):
+            if type(self) is not type(other):
+                return NotImplemented
+            return self.value < other.value
+
+        def __str__(self):
+            return str(self.value)
+
+    values = [X(4), X(23), X(42), X(-1)]
+    env = Environment()
+    rv = env.render_str("{{ values|sort|join(',') }}", values=values)
+    assert rv == "-1,4,23,42"
+
+
+def test_fucked_up_object():
+    @total_ordering
+    class X:
+        __lt__ = __eq__ = lambda s, o: random.random() > 0.5
+
+    values = [X()] * 500
+    env = Environment()
+    with pytest.raises(
+        TemplateError,
+        match="invalid operation: failed to sort: user-provided comparison function does not correctly implement a total order",
+    ):
+        env.eval_expr("values|sort", values=values)
+
+
+def test_threading_interactions():
+    from time import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    done = []
+
+    def busy_wait(value, seconds: float):
+        start = time()
+        while time() - start < seconds:
+            continue
+        done.append(value)
+        return value
+
+    env = Environment(filters={"busy_wait": busy_wait})
+    executor = ThreadPoolExecutor()
+
+    for _ in range(4):
+        executor.submit(lambda: env.render_str("{{ 'something' | busy_wait(0.1) }}"))
+
+    executor.shutdown(wait=True)
+    assert done == ["something"] * 4
+
+
+def test_truthy():
+    class Custom:
+        def __init__(self, is_true):
+            self.is_true = is_true
+
+        def __bool__(self):
+            return bool(self.is_true)
+
+    env = Environment()
+    assert env.eval_expr("x|bool", x=Custom(True)) is True
+    assert env.eval_expr("x|bool", x=Custom(False)) is False
+    assert env.eval_expr("x|bool", x=Custom(None)) is False
+    assert env.eval_expr("x|bool", x=Custom("")) is False
+    assert env.eval_expr("x|bool", x=Custom("foo")) is True
+
+    class Fallback:
+        def __bool__(self):
+            raise RuntimeError("swallowed but true")
+
+    assert env.eval_expr("x|bool", x=Fallback()) is True
+
+
+def test_load_from_path():
+    env = Environment(loader=load_from_path("tests/templates"))
+    rv = env.render_template("base.txt", woot="woot")
+    assert rv.strip() == "I am from foo! woot!"
+
+    with pytest.raises(TemplateError) as e:
+        env.render_template("missing.txt")
+    assert e.value.kind == "TemplateNotFound"
+
+    with pytest.raises(TemplateError) as e:
+        env.render_template("../test_basic.py")
+    assert e.value.kind == "TemplateNotFound"
+
+
+def test_pycompat():
+    env = Environment()
+    assert env.eval_expr("{'x': 42}.get('x')") == 42
+
+    env.pycompat = False
+    with pytest.raises(TemplateError) as e:
+        assert env.eval_expr("{'x': 42}.get('x')")
+    assert "unknown method: map has no method named get" in e.value.message
+
+
+def test_striptags():
+    env = Environment()
+    assert env.eval_expr("'<a>foo</a>'|striptags") == "foo"
+    assert env.eval_expr("'<a>&auml;</a>'|striptags") == "ä"
+
+
+def test_wordwrap():
+    env = Environment()
+    assert (
+        env.eval_expr("text|wordwrap(width=20)", text="the quick brown fox jumps")
+        == "the quick brown fox\njumps"
+    )
+
+
+def test_attribute_lookups():
+    class X:
+        def __getattr__(self, _):
+            raise RuntimeError("boom")
+
+    env = Environment()
+    with pytest.raises(RuntimeError, match="boom"):
+        env.eval_expr("x.foo", x=X())

@@ -6,7 +6,7 @@ use minijinja::{context, Environment, Value};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use crate::print_error;
+use crate::cli::print_error;
 
 pub fn run(mut env: Environment, ctx: Value) -> Result<(), Error> {
     let mut editor = DefaultEditor::new()?;
@@ -74,11 +74,7 @@ enum Command<'a> {
 }
 
 fn parse_command(line: &str) -> Option<Command<'_>> {
-    let line = if let Some(rest) = line.strip_prefix('.') {
-        rest.trim()
-    } else {
-        return None;
-    };
+    let line = line.strip_prefix('.')?.trim();
     match line {
         "exit" | "quit" => return Some(Command::Quit),
         "help" => return Some(Command::Help),
@@ -114,7 +110,7 @@ fn eval(
 ) -> Option<Value> {
     match env.compile_expression(line).and_then(|expr| {
         expr.eval(context!(
-            ..Value::from_iter(locals.iter().map(|x| (x.0.clone(), x.1.clone()))),
+            ..Value::from_pairs(locals.iter().map(|x| (x.0.clone(), x.1.clone()))),
             ..ctx.clone()
         ))
     }) {
@@ -130,12 +126,12 @@ fn render(env: &Environment, template: &str, ctx: &Value, locals: &BTreeMap<Stri
     match env.render_str(
         template,
         context!(
-            ..Value::from_iter(locals.iter().map(|x| (x.0.clone(), x.1.clone()))),
+            ..Value::from_pairs(locals.iter().map(|x| (x.0.clone(), x.1.clone()))),
             ..ctx.clone()
         ),
     ) {
         Ok(rv) => {
-            println!("{}", rv);
+            println!("{rv}");
         }
         Err(err) => print_error(&Error::from(err)),
     }
@@ -145,16 +141,16 @@ fn print_result(value: &Value) {
     if value.is_undefined() {
         // nothing
     } else if let Some(s) = value.as_str() {
-        println!("{:?}", s);
+        println!("{s:?}");
     } else if let Some(b) = value.as_bytes() {
         println!("{:?}", BytesRef(b));
     } else {
-        println!("{}", value);
+        println!("{value}");
     }
 }
 
 fn print(value: Value) -> Value {
-    println!("{}", value);
+    println!("{value}");
     Value::UNDEFINED
 }
 
@@ -178,7 +174,7 @@ impl fmt::Debug for BytesRef<'_> {
             } else if (0x20..0x7f).contains(&b) {
                 write!(f, "{}", b as char)?;
             } else {
-                write!(f, "\\x{:02x}", b)?;
+                write!(f, "\\x{b:02x}")?;
             }
         }
         write!(f, "\"")?;

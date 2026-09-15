@@ -21,6 +21,12 @@ impl<T> AbiResult for *mut T {
     }
 }
 
+impl<T> AbiResult for *const T {
+    fn err_value() -> Self {
+        ptr::null()
+    }
+}
+
 impl AbiResult for u64 {
     fn err_value() -> Self {
         0
@@ -57,11 +63,11 @@ impl Scope {
 }
 
 pub(crate) fn catch<F: FnOnce(&Scope) -> Result<R, Error>, R: AbiResult>(f: F) -> R {
-    LAST_ERROR.with_borrow_mut(|x| *x = None);
+    LAST_ERROR.with(|x| *x.borrow_mut() = None);
     match f(&Scope) {
         Ok(result) => result,
         Err(err) => {
-            LAST_ERROR.with_borrow_mut(|x| *x = Some(err));
+            LAST_ERROR.with(|x| *x.borrow_mut() = Some(err));
             R::err_value()
         }
     }

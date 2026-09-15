@@ -43,7 +43,7 @@ pub fn find_macro_closure<'a>(m: &ast::Macro<'a>) -> HashSet<&'a str> {
         nested_out: None,
         assigned: vec![Default::default()],
     };
-    tracker_visit_macro(m, &mut state);
+    tracker_visit_macro(m, &mut state, false);
     state.out
 }
 
@@ -73,12 +73,32 @@ fn tracker_visit_expr_opt<'a>(expr: &Option<ast::Expr<'a>>, state: &mut Assignme
 }
 
 #[cfg(feature = "macros")]
-fn tracker_visit_macro<'a>(m: &ast::Macro<'a>, state: &mut AssignmentTracker<'a>) {
+fn tracker_visit_macro<'a>(
+    m: &ast::Macro<'a>,
+    state: &mut AssignmentTracker<'a>,
+    declare_caller: bool,
+) {
+    if declare_caller {
+        // this is not completely correct as caller is actually only defined
+        // if the macro was used in the context of a call block.  However it
+        // is impossible to determine this at compile time so we err on the
+        // side of assuming caller is there.
+        state.assign("caller");
+    }
     m.args.iter().for_each(|arg| track_assign(arg, state));
     m.defaults
         .iter()
         .for_each(|expr| tracker_visit_expr(expr, state));
     m.body.iter().for_each(|node| track_walk(node, state));
+}
+
+fn tracker_visit_callarg<'a>(callarg: &ast::CallArg<'a>, state: &mut AssignmentTracker<'a>) {
+    match callarg {
+        ast::CallArg::Pos(expr)
+        | ast::CallArg::Kwarg(_, expr)
+        | ast::CallArg::PosSplat(expr)
+        | ast::CallArg::KwargSplat(expr) => tracker_visit_expr(expr, state),
+    }
 }
 
 fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
@@ -101,6 +121,12 @@ fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a
             tracker_visit_expr(&expr.left, state);
             tracker_visit_expr(&expr.right, state);
         }
+        ast::Expr::Compare(expr) => {
+            tracker_visit_expr(&expr.expr, state);
+            expr.ops
+                .iter()
+                .for_each(|op| tracker_visit_expr(&op.expr, state));
+        }
         ast::Expr::IfExpr(expr) => {
             tracker_visit_expr(&expr.test_expr, state);
             tracker_visit_expr(&expr.true_expr, state);
@@ -108,11 +134,15 @@ fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a
         }
         ast::Expr::Filter(expr) => {
             tracker_visit_expr_opt(&expr.expr, state);
-            expr.args.iter().for_each(|x| tracker_visit_expr(x, state));
+            expr.args
+                .iter()
+                .for_each(|x| tracker_visit_callarg(x, state));
         }
         ast::Expr::Test(expr) => {
             tracker_visit_expr(&expr.expr, state);
-            expr.args.iter().for_each(|x| tracker_visit_expr(x, state));
+            expr.args
+                .iter()
+                .for_each(|x| tracker_visit_callarg(x, state));
         }
         ast::Expr::GetAttr(expr) => {
             // if we are tracking nested, we check if we have a chain of attribute
@@ -127,7 +157,7 @@ fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a
                             if !state.is_assigned(var.id) {
                                 let mut rv = var.id.to_string();
                                 for attr in attrs.iter().rev() {
-                                    write!(rv, ".{}", attr).ok();
+                                    write!(rv, ".{attr}").ok();
                                 }
                                 state.assign_nested(rv);
                                 return;
@@ -157,17 +187,16 @@ fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a
         }
         ast::Expr::Call(expr) => {
             tracker_visit_expr(&expr.expr, state);
-            expr.args.iter().for_each(|x| tracker_visit_expr(x, state));
+            expr.args
+                .iter()
+                .for_each(|x| tracker_visit_callarg(x, state));
         }
         ast::Expr::List(expr) => expr.items.iter().for_each(|x| tracker_visit_expr(x, state)),
+        ast::Expr::Tuple(expr) => expr.items.iter().for_each(|x| tracker_visit_expr(x, state)),
         ast::Expr::Map(expr) => expr.keys.iter().zip(expr.values.iter()).for_each(|(k, v)| {
             tracker_visit_expr(k, state);
             tracker_visit_expr(v, state);
         }),
-        ast::Expr::Kwargs(expr) => expr
-            .pairs
-            .iter()
-            .for_each(|(_, v)| tracker_visit_expr(v, state)),
     }
 }
 
@@ -175,6 +204,7 @@ fn track_assign<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
     match expr {
         ast::Expr::Var(var) => state.assign(var.id),
         ast::Expr::List(list) => list.items.iter().for_each(|x| track_assign(x, state)),
+        ast::Expr::Tuple(tuple) => tuple.items.iter().for_each(|x| track_assign(x, state)),
         _ => {}
     }
 }
@@ -257,7 +287,9 @@ fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
         #[cfg(feature = "macros")]
         ast::Stmt::Macro(stmt) => {
             state.assign(stmt.name);
-            tracker_visit_macro(stmt, state);
+            state.push();
+            tracker_visit_macro(stmt, state, true);
+            state.pop();
         }
         #[cfg(feature = "macros")]
         ast::Stmt::CallBlock(stmt) => {
@@ -265,8 +297,10 @@ fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
             stmt.call
                 .args
                 .iter()
-                .for_each(|x| tracker_visit_expr(x, state));
-            tracker_visit_macro(&stmt.macro_decl, state);
+                .for_each(|x| tracker_visit_callarg(x, state));
+            state.push();
+            tracker_visit_macro(&stmt.macro_decl, state, true);
+            state.pop();
         }
         #[cfg(feature = "loop_controls")]
         ast::Stmt::Continue(_) | ast::Stmt::Break(_) => {}
@@ -275,7 +309,7 @@ fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
             stmt.call
                 .args
                 .iter()
-                .for_each(|x| tracker_visit_expr(x, state));
+                .for_each(|x| tracker_visit_callarg(x, state));
         }
     }
 }

@@ -18,12 +18,12 @@ pub struct WhitespaceConfig {
 pub struct Tokenizer<'s> {
     stack: Vec<LexerState>,
     source: &'s str,
-    current_line: u32,
-    current_col: u32,
+    filename: &'s str,
+    current_line: u16,
+    current_col: u16,
     current_offset: usize,
     trim_leading_whitespace: bool,
     pending_start_marker: Option<(StartMarker, usize)>,
-    #[cfg(feature = "custom_syntax")]
     paren_balance: isize,
     syntax_config: SyntaxConfig,
     ws_config: WhitespaceConfig,
@@ -86,10 +86,7 @@ fn find_start_marker_memchr(a: &str) -> Option<(usize, StartMarker, usize, White
     let bytes = a.as_bytes();
     let mut offset = 0;
     loop {
-        let idx = match memchr(&bytes[offset..], b'{') {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let idx = some!(memchr(&bytes[offset..], b'{'));
         let marker = match bytes.get(offset + idx + 1).copied() {
             Some(b'{') => StartMarker::Variable,
             Some(b'%') => StartMarker::Block,
@@ -112,9 +109,8 @@ fn find_start_marker(
 ) -> Option<(usize, StartMarker, usize, Whitespace)> {
     // If we have a custom delimiter we need to use the aho-corasick
     // otherwise we can use internal memchr.
-    let ac = match syntax_config.aho_corasick {
-        Some(ref ac) => ac,
-        None => return find_start_marker_memchr(&a[offset..]),
+    let Some(ref ac) = syntax_config.aho_corasick else {
+        return find_start_marker_memchr(&a[offset..]);
     };
 
     let bytes = &a.as_bytes()[offset..];
@@ -148,7 +144,7 @@ fn find_start_marker(
         };
         let new_match = (m.start(), marker, m.len() + ws.len(), ws);
 
-        if longest_match.as_ref().map_or(false, |x| new_match.0 > x.0) {
+        if longest_match.as_ref().is_some_and(|x| new_match.0 > x.0) {
             break;
         }
         longest_match = Some(new_match);
@@ -230,8 +226,17 @@ fn lstrip_block(s: &str) -> &str {
     }
 }
 
-fn should_lstrip_block(flag: bool, marker: StartMarker) -> bool {
+fn should_lstrip_block(flag: bool, marker: StartMarker, prefix: &str) -> bool {
     if flag && !matches!(marker, StartMarker::Variable) {
+        // Only strip if we're at the start of a line
+        for c in prefix.chars().rev() {
+            if is_nl(c) {
+                return true;
+            } else if !c.is_whitespace() {
+                return false;
+            }
+        }
+        // If we get here, we're at the start of the file
         return true;
     }
     #[cfg(feature = "custom_syntax")]
@@ -287,10 +292,18 @@ impl<'s> Tokenizer<'s> {
     /// Creates a new tokenizer.
     pub fn new(
         input: &'s str,
+        filename: &'s str,
         in_expr: bool,
         syntax_config: SyntaxConfig,
         whitespace_config: WhitespaceConfig,
     ) -> Tokenizer<'s> {
+        let mut stack = Vec::with_capacity(8);
+        stack.push(if in_expr {
+            LexerState::Variable
+        } else {
+            LexerState::Template
+        });
+
         let mut source = input;
         if !whitespace_config.keep_trailing_newline {
             if source.ends_with('\n') {
@@ -302,21 +315,27 @@ impl<'s> Tokenizer<'s> {
         }
         Tokenizer {
             source,
-            stack: vec![if in_expr {
-                LexerState::Variable
-            } else {
-                LexerState::Template
-            }],
+            filename,
+            stack,
             current_line: 1,
             current_col: 0,
             current_offset: 0,
-            #[cfg(feature = "custom_syntax")]
             paren_balance: 0,
             trim_leading_whitespace: false,
             pending_start_marker: None,
             syntax_config,
             ws_config: whitespace_config,
         }
+    }
+
+    /// Returns the current filename.
+    pub fn filename(&self) -> &str {
+        self.filename
+    }
+
+    /// Returns the source.
+    pub fn source(&self) -> &'s str {
+        self.source
     }
 
     /// Produces the next token from the tokenizer.
@@ -350,25 +369,26 @@ impl<'s> Tokenizer<'s> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn rest(&self) -> &'s str {
         &self.source[self.current_offset..]
     }
 
-    #[inline]
+    #[inline(always)]
     fn rest_bytes(&self) -> &'s [u8] {
         &self.source.as_bytes()[self.current_offset..]
     }
 
+    #[inline(always)]
     fn advance(&mut self, bytes: usize) -> &'s str {
         let skipped = &self.rest()[..bytes];
         for c in skipped.chars() {
             match c {
                 '\n' => {
-                    self.current_line += 1;
+                    self.current_line = self.current_line.saturating_add(1);
                     self.current_col = 0;
                 }
-                _ => self.current_col += 1,
+                _ => self.current_col = self.current_col.saturating_add(1),
             }
         }
         self.current_offset += bytes;
@@ -376,7 +396,7 @@ impl<'s> Tokenizer<'s> {
     }
 
     #[inline]
-    fn loc(&self) -> (u32, u32, u32) {
+    fn loc(&self) -> (u16, u16, u32) {
         (
             self.current_line,
             self.current_col,
@@ -385,7 +405,7 @@ impl<'s> Tokenizer<'s> {
     }
 
     #[inline]
-    fn span(&self, (start_line, start_col, start_offset): (u32, u32, u32)) -> Span {
+    fn span(&self, (start_line, start_col, start_offset): (u16, u16, u32)) -> Span {
         Span {
             start_line,
             start_col,
@@ -398,7 +418,14 @@ impl<'s> Tokenizer<'s> {
 
     #[inline]
     fn syntax_error(&mut self, msg: &'static str) -> Error {
-        Error::new(ErrorKind::SyntaxError, msg)
+        let mut span = self.span(self.loc());
+        if span.start_col == span.end_col {
+            span.end_col += 1;
+            span.end_offset += 1;
+        }
+        let mut err = Error::new(ErrorKind::SyntaxError, msg);
+        err.set_filename_and_span(self.filename, span);
+        err
     }
 
     fn eat_number(&mut self) -> Result<(Token<'s>, Span), Error> {
@@ -435,7 +462,15 @@ impl<'s> Tokenizer<'s> {
         let mut has_underscore = false;
         for c in self.rest_bytes()[num_len..].iter().copied() {
             state = match (c, state) {
-                (b'.', State::Integer) => State::Fraction,
+                (b'.', State::Integer) => {
+                    let bytes = self.rest_bytes();
+                    let is_exp = matches!(bytes.get(num_len + 1), Some(b'e' | b'E'))
+                        && matches!(bytes.get(num_len + 2), Some(b'+' | b'-' | b'0'..=b'9'));
+                    if !is_exp && lex_identifier(&self.rest()[num_len + 1..]) > 0 {
+                        break;
+                    }
+                    State::Fraction
+                }
                 (b'E' | b'e', State::Integer | State::Fraction) => State::Exponent,
                 (b'+' | b'-', State::Exponent) => State::ExponentSign,
                 (b'0'..=b'9', State::Exponent) => State::ExponentSign,
@@ -468,8 +503,8 @@ impl<'s> Tokenizer<'s> {
                 Ok(Token::Int(int))
             } else {
                 u128::from_str_radix(&num, radix)
-                    .map(Token::Int128)
-                    .map_err(|_| self.syntax_error("invalid integer"))
+                    .map(|x| Token::Int128(Box::new(x)))
+                    .map_err(|_| self.syntax_error("invalid integer (too large)"))
             }),
             self.span(old_loc),
         ))
@@ -509,15 +544,13 @@ impl<'s> Tokenizer<'s> {
             })
             .count();
         if escaped || self.rest_bytes().get(str_len + 1) != Some(&delim) {
+            self.advance(str_len + 1);
             return Err(self.syntax_error("unexpected end of string"));
         }
         let s = self.advance(str_len + 2);
         Ok(if has_escapes {
             (
-                Token::String(match unescape(&s[1..s.len() - 1]) {
-                    Ok(unescaped) => unescaped,
-                    Err(err) => return Err(err),
-                }),
+                Token::String(ok!(unescape(&s[1..s.len() - 1])).into_boxed_str()),
                 self.span(old_loc),
             )
         } else {
@@ -590,7 +623,11 @@ impl<'s> Tokenizer<'s> {
                     self.pending_start_marker = Some((marker, len));
                     match whitespace {
                         Whitespace::Default
-                            if should_lstrip_block(self.ws_config.lstrip_blocks, marker) =>
+                            if should_lstrip_block(
+                                self.ws_config.lstrip_blocks,
+                                marker,
+                                &self.source[..self.current_offset + start],
+                            ) =>
                         {
                             let peeked = &self.rest()[..start];
                             let trimmed = lstrip_block(peeked);
@@ -638,6 +675,7 @@ impl<'s> Tokenizer<'s> {
                     self.handle_tail_ws(ws);
                     Ok(ControlFlow::Continue(()))
                 } else {
+                    self.advance(self.rest_bytes().len());
                     Err(self.syntax_error("unexpected end of comment"))
                 }
             }
@@ -726,6 +764,7 @@ impl<'s> Tokenizer<'s> {
                 return Ok(ControlFlow::Break((Token::TemplateData(result), span)));
             }
         }
+        self.advance(self.rest_bytes().len());
         Err(self.syntax_error("unexpected end of raw block"))
     }
 
@@ -776,50 +815,52 @@ impl<'s> Tokenizer<'s> {
         }
 
         // look out for the end of blocks
-        match sentinel {
-            BlockSentinel::Block => {
-                if matches!(rest.get(..1), Some("-" | "+"))
-                    && rest[1..].starts_with(self.block_end())
-                {
-                    self.stack.pop();
-                    let was_minus = &rest[..1] == "-";
-                    self.advance(self.block_end().len() + 1);
-                    let span = self.span(old_loc);
-                    if was_minus {
-                        self.trim_leading_whitespace = true;
+        if self.paren_balance == 0 {
+            match sentinel {
+                BlockSentinel::Block => {
+                    if matches!(rest.get(..1), Some("-" | "+"))
+                        && rest[1..].starts_with(self.block_end())
+                    {
+                        self.stack.pop();
+                        let was_minus = &rest[..1] == "-";
+                        self.advance(self.block_end().len() + 1);
+                        let span = self.span(old_loc);
+                        if was_minus {
+                            self.trim_leading_whitespace = true;
+                        }
+                        return Ok(ControlFlow::Break((Token::BlockEnd, span)));
                     }
-                    return Ok(ControlFlow::Break((Token::BlockEnd, span)));
-                }
-                if rest.starts_with(self.block_end()) {
-                    self.stack.pop();
-                    self.advance(self.block_end().len());
-                    let span = self.span(old_loc);
-                    self.skip_newline_if_trim_blocks();
-                    return Ok(ControlFlow::Break((Token::BlockEnd, span)));
-                }
-            }
-            BlockSentinel::Variable => {
-                if matches!(rest.get(..1), Some("-" | "+"))
-                    && rest[1..].starts_with(self.variable_end())
-                {
-                    self.stack.pop();
-                    let was_minus = &rest[..1] == "-";
-                    self.advance(self.variable_end().len() + 1);
-                    let span = self.span(old_loc);
-                    if was_minus {
-                        self.trim_leading_whitespace = true;
+                    if rest.starts_with(self.block_end()) {
+                        self.stack.pop();
+                        self.advance(self.block_end().len());
+                        let span = self.span(old_loc);
+                        self.skip_newline_if_trim_blocks();
+                        return Ok(ControlFlow::Break((Token::BlockEnd, span)));
                     }
-                    return Ok(ControlFlow::Break((Token::VariableEnd, span)));
                 }
-                if rest.starts_with(self.variable_end()) {
-                    self.stack.pop();
-                    self.advance(self.variable_end().len());
-                    return Ok(ControlFlow::Break((Token::VariableEnd, self.span(old_loc))));
+                BlockSentinel::Variable => {
+                    if matches!(rest.get(..1), Some("-" | "+"))
+                        && rest[1..].starts_with(self.variable_end())
+                    {
+                        self.stack.pop();
+                        let was_minus = &rest[..1] == "-";
+                        self.advance(self.variable_end().len() + 1);
+                        let span = self.span(old_loc);
+                        if was_minus {
+                            self.trim_leading_whitespace = true;
+                        }
+                        return Ok(ControlFlow::Break((Token::VariableEnd, span)));
+                    }
+                    if rest.starts_with(self.variable_end()) {
+                        self.stack.pop();
+                        self.advance(self.variable_end().len());
+                        return Ok(ControlFlow::Break((Token::VariableEnd, self.span(old_loc))));
+                    }
                 }
+                // line statements are handled above
+                #[cfg(feature = "custom_syntax")]
+                BlockSentinel::LineStatement => {}
             }
-            // line statements are handled above
-            #[cfg(feature = "custom_syntax")]
-            BlockSentinel::LineStatement => {}
         }
 
         // two character operators
@@ -839,10 +880,7 @@ impl<'s> Tokenizer<'s> {
 
         macro_rules! with_paren_balance {
             ($delta:expr, $tok:expr) => {{
-                #[cfg(feature = "custom_syntax")]
-                {
-                    self.paren_balance += $delta;
-                }
+                self.paren_balance += $delta;
                 Some($tok)
             }};
         }
@@ -854,7 +892,6 @@ impl<'s> Tokenizer<'s> {
             Some(b'*') => Some(Token::Mul),
             Some(b'/') => Some(Token::Div),
             Some(b'%') => Some(Token::Mod),
-            Some(b'!') => Some(Token::Bang),
             Some(b'.') => Some(Token::Dot),
             Some(b',') => Some(Token::Comma),
             Some(b':') => Some(Token::Colon),
@@ -897,7 +934,8 @@ pub fn tokenize(
 ) -> impl Iterator<Item = Result<(Token<'_>, Span), Error>> {
     // This function is unused in minijinja itself, it's only used in tests and in the
     // unstable machinery as a convenient alternative to the tokenizer.
-    let mut tokenizer = Tokenizer::new(input, in_expr, syntax_config, whitespace_config);
+    let mut tokenizer =
+        Tokenizer::new(input, "<string>", in_expr, syntax_config, whitespace_config);
     std::iter::from_fn(move || tokenizer.next_token().transpose())
 }
 

@@ -5,9 +5,8 @@ the state of compatibility and future direction is.
 
 ## Syntax Differences
 
-MiniJinja does not support line statements and custom delimiters are an
-optional feature that is largely discouraged.  For custom delimiters the
-`custom_syntax` feature needs to be enabled.
+Custom delimiters are an optional feature that is largely discouraged. 
+For custom delimiters the `custom_syntax` feature needs to be enabled.
 
 MiniJinja by default does not allow unicode identifiers.  These need to be
 turned on with the `unicode` feature to achieve parity with Jinja2.
@@ -16,7 +15,7 @@ turned on with the `unicode` feature to achieve parity with Jinja2.
 
 The biggest differences between MiniJinja and Jinja2 stem from the different
 runtime environments.  Jinja2 leaks out a lot of the underlying Python engine
-whereas MiniJinja implements it's own runtime data model.
+whereas MiniJinja implements its own runtime data model.
 
 The most significant differences are documented here:
 
@@ -33,20 +32,18 @@ crate.
 
 ### Tuples
 
-MiniJinja does not implement tuples.  The creation of tuples with tuple syntax
-instead creates lists.
+MiniJinja supports tuple literals and preserves tuples as a distinct sequence
+type. Tuple rendering, concatenation, repetition, and slicing follow Python's
+behavior. Rust tuples converted through `Value::from` or the explicit Serde
+wrapper also remain tuples.
 
 ### Keyword Arguments
 
-MiniJinja maps keyword arguments to the creation of dictionaries which are passed
-as last argument.  This is done as keyword arguments are not native to Rust and
-mapping them to filter functions is tricky.  This also means that some filters in
-MiniJinja do not accept the parameters with keyword arguments whereas in Jinja2
-they do.
-
-### Variadic Calls
-
-MiniJinja does not support the `*args` and `**kwargs` syntax for calls.
+MiniJinja maps keyword arguments to a distinguished internal map passed as the
+last argument. Rust filters and functions normally declare a `Kwargs` parameter
+to consume them. A regular `Value` argument rejects this internal map so unknown
+keyword arguments cannot be mistaken for positional values; forwarding APIs can
+opt in with `ValueOrKwargs`.
 
 ### Undefined
 
@@ -135,12 +132,11 @@ useful.
 
 ### `{% continue %}`
 
-`continue` is not supported. You can, however, filter a sequence during
-iteration to skip items.
+`continue` is supported only if the `loop_controls` feature is enabled.
 
 ### `{% break %}`
 
-`break` is not supported.
+`break` is supported only if the `loop_controls` feature is enabled.
 
 ## Expressions
 
@@ -157,4 +153,12 @@ are available in MiniJinja or behave the same.
 ## Filters
 
 MiniJinja supports many common Jinja2 filters but leaves out some.  For instance
-some string formatting filters like `|xmlattr` or `|urlize` are missing.
+some string formatting filters like `|xmlattr` or `|urlize` are missing.  Additionally
+some filters do not support all the same arguments or only support some arguments
+as positional ones.
+
+It's a soft goal to increase the number of filters that are supported and to
+match the behavior of Jinja2 as close as possible but there are some situations
+where it might be acceptable to deviate.  For instance there are some filters
+which in Jinja2 support an `attribute` argument.  Most of those filters currently
+do not support that argument in MiniJinja.

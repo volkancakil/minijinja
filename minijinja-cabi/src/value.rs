@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
 use std::mem::{transmute, ManuallyDrop};
 use std::ops::Deref;
+use std::ptr;
 use std::sync::Arc;
 
 use minijinja::value::{Object, ValueIter, ValueKind};
@@ -39,7 +40,15 @@ where
 /// Opaque value type.
 #[repr(C)]
 pub struct mj_value {
-    _opaque: [usize; 3],
+    // Motivation on the size here: The size of `Value` is really not
+    // known and the C header must expose a matching size, so we have
+    // to be creative.  The dominating type size wise is
+    // most likely going to be SmallStr which is a u8+[u8; 22] plus the
+    // enum discriminant (u8).
+    //
+    // We are going with u64 here for alignment reasons which is likely
+    // to be a good default across platforms.
+    _opaque: [u64; 3],
 }
 
 impl mj_value {
@@ -51,7 +60,7 @@ impl mj_value {
 impl From<Value> for mj_value {
     fn from(value: Value) -> Self {
         mj_value {
-            _opaque: unsafe { transmute::<Value, [usize; 3]>(value) },
+            _opaque: unsafe { transmute::<Value, [u64; 3]>(value) },
         }
     }
 }
@@ -88,6 +97,17 @@ ffi_fn! {
     /// Creates a new string value
     unsafe fn mj_value_new_string(scope, s: *const c_char) -> mj_value {
         Value::from(scope.get_str(s)?).into()
+    }
+}
+
+ffi_fn! {
+    /// Creates an new bytes value
+    unsafe fn mj_value_new_bytes(_scope, b: *const c_char, length: usize) -> mj_value {
+        Value::from_bytes(if b.is_null() || length == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(b as *const u8, length as usize)
+        }.to_vec()).into()
     }
 }
 
@@ -164,7 +184,13 @@ ffi_fn! {
         key: *const c_char,
         value: mj_value
     ) -> bool {
-        mj_value_set_key(slf, Value::from(scope.get_str(key)?).into(), value)
+        let value = value.into_value();
+        let key = Value::from(scope.get_str(key)?);
+        with_cow(slf, |map: &mut BTreeMap<Value, Value>| {
+            map.insert(key, value);
+            Ok(())
+        })?;
+        true
     }
 }
 
@@ -178,9 +204,11 @@ ffi_fn! {
         key: mj_value,
         value: mj_value
     ) -> bool {
+        let key = key.into_value();
+        let value = value.into_value();
         // TODO: make this work with other ValueMap types too.
         with_cow(slf, |map: &mut BTreeMap<Value, Value>| {
-            map.insert(key.into_value(), value.into_value());
+            map.insert(key, value);
             Ok(())
         })?;
         true
@@ -196,8 +224,9 @@ ffi_fn! {
         slf: &mut mj_value,
         value: mj_value,
     ) -> bool {
+        let value = value.into_value();
         with_cow(slf, |seq: &mut Vec<Value>| {
-            seq.push(value.into_value());
+            seq.push(value);
             Ok(())
         })?;
         true
@@ -266,6 +295,22 @@ ffi_fn! {
 }
 
 ffi_fn! {
+    /// If the value is a string or bytes, returns it the pointer
+    /// to it, and the length.
+    ///
+    /// Note that strings are not null terminated.  If you need that, use
+    /// `mj_value_to_str` which will also stringify non string values.
+    unsafe fn mj_value_as_bytes(_scope, value: mj_value, len_out: &mut usize) -> *const c_char {
+        if let Some(bytes) = value.as_bytes() {
+            *len_out = bytes.len();
+            bytes.as_ptr() as *const c_char
+        } else {
+            ptr::null()
+        }
+    }
+}
+
+ffi_fn! {
     /// Extracts an integer from the value
     unsafe fn mj_value_as_i64(_scope, value: mj_value) -> i64 {
         value.as_i64().unwrap_or_default()
@@ -317,17 +362,22 @@ ffi_fn! {
 ffi_fn! {
     /// Looks up an element by a string index in an object.
     unsafe fn mj_value_get_by_str(_scope, value: mj_value, key: *const c_char) -> mj_value {
-        let key = CStr::from_ptr(key);
-        if let Ok(key) = key.to_str() {
-            value.get_attr(key).unwrap_or_default()
-        } else {
+        if key.is_null() {
             Value::UNDEFINED
-        }.into()
+        } else {
+            let key = CStr::from_ptr(key);
+            if let Ok(key) = key.to_str() {
+                value.get_attr(key).unwrap_or_default()
+            } else {
+                Value::UNDEFINED
+            }
+        }
+        .into()
     }
 }
 
 ffi_fn! {
-    /// Looks up an element by a vaue
+    /// Looks up an element by a value
     unsafe fn mj_value_get_by_value(_scope, value: mj_value, key: mj_value) -> mj_value {
         value.get_item(&key as &Value).unwrap_or_default().into()
     }
@@ -362,23 +412,29 @@ ffi_fn! {
 ffi_fn! {
     /// Ends the iteration and deallocates the iterator
     unsafe fn mj_value_iter_free(_scope, iter: *mut mj_value_iter) {
-        let _ = Box::from_raw(iter);
+        if !iter.is_null() {
+            let _ = Box::from_raw(iter);
+        }
     }
 }
 
 ffi_fn! {
     /// Increments the refcount
     unsafe fn mj_value_incref(_scope, value: *mut mj_value) {
-        let value: &Value = &*value;
-        let _ = ManuallyDrop::new(value.clone());
+        if !value.is_null() {
+            let value: &Value = &*value;
+            let _ = ManuallyDrop::new(value.clone());
+        }
     }
 }
 
 ffi_fn! {
     /// Decrements the refcount
     unsafe fn mj_value_decref(_scope, value: *mut mj_value) {
-        let mut value: ManuallyDrop<Value> = transmute((*value)._opaque);
-        ManuallyDrop::drop(&mut value);
+        if !value.is_null() {
+            let mut value: ManuallyDrop<Value> = transmute((*value)._opaque);
+            ManuallyDrop::drop(&mut value);
+        }
     }
 }
 

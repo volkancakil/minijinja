@@ -45,17 +45,18 @@
     doc = r#"
 # Arguments in Custom Functions
 
-All arguments in custom functions must implement the [`ArgType`] trait.
+All value arguments in custom functions must implement the [`ArgType`] trait.
+An optional leading `&State` or `&mut State` parameter is handled separately.
 Standard types, such as `String`, `i32`, `bool`, `f64`, etc, already implement this trait.
 There are also helper types that will make it easier to extract an arguments with custom types.
-The [`ViaDeserialize<T>`](crate::value::ViaDeserialize) type, for instance, can accept any
+The [`Serde<T>`](crate::value::Serde) type, for instance, can accept any
 type `T` that implements the `Deserialize` trait from `serde`.
 
 ```rust
 # use minijinja::Environment;
 # use serde::Deserialize;
 # let mut env = Environment::new();
-use minijinja::value::ViaDeserialize;
+use minijinja::value::Serde;
 
 #[derive(Deserialize)]
 struct Person {
@@ -63,7 +64,7 @@ struct Person {
     age: i32,
 }
 
-fn is_adult(person: ViaDeserialize<Person>) -> bool {
+fn is_adult(person: Serde<Person>) -> bool {
     person.age >= 18
 }
 
@@ -84,10 +85,10 @@ env.add_function("is_adult", is_adult);
 //! [1, 2, {"three": 3, "four": 4}]
 //! ```
 //!
-//! If a function wants to disambiguate between a value passed as keyword argument or not,
-//! the [`Value::is_kwargs`] can be used which returns `true` if a value represents
-//! keyword arguments as opposed to just a map.  A more convenient way to work with keyword
-//! arguments is the [`Kwargs`](crate::value::Kwargs) type.
+//! Regular [`Value`] arguments reject the internal keyword-argument value. Functions that
+//! declare keyword arguments should use [`Kwargs`](crate::value::Kwargs). Variadic functions
+//! that need to forward or manually split all arguments can use
+//! [`ValueOrKwargs`](crate::value::ValueOrKwargs).
 //!
 //! # Built-in Functions
 //!
@@ -97,6 +98,7 @@ env.add_function("is_adult", is_adult);
 //! called from Rust code as their exact interface (arguments and return types)
 //! might change from one MiniJinja version to another.
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -104,7 +106,7 @@ use crate::utils::SealedMarker;
 use crate::value::{ArgType, FunctionArgs, FunctionResult, Object, ObjectRepr, Value};
 use crate::vm::State;
 
-type FuncFunc = dyn Fn(&State, &[Value]) -> Result<Value, Error> + Sync + Send + 'static;
+type FuncFunc = dyn Fn(&mut State, &[Value]) -> Result<Value, Error> + Sync + Send + 'static;
 
 /// A boxed function.
 #[derive(Clone)]
@@ -115,9 +117,10 @@ pub(crate) struct BoxedFunction(Arc<FuncFunc>, #[cfg(feature = "debug")] &'stati
 /// This trait is used by the [`add_function`](crate::Environment::add_function)
 /// method to abstract over different types of functions.
 ///
-/// Functions which at the very least accept the [`State`] by reference as first
-/// parameter and additionally up to 4 further parameters.  They share much of
-/// their interface with [`filters`](crate::filters).
+/// Functions can optionally accept the [`State`] by immutable reference as an
+/// implicit parameter in any position.  They can instead take `&mut State` as
+/// their first parameter and additionally up to 4 further parameters.  They
+/// share much of their interface with [`filters`](crate::filters).
 ///
 /// A function can return any of the following types:
 ///
@@ -136,6 +139,9 @@ pub(crate) struct BoxedFunction(Arc<FuncFunc>, #[cfg(feature = "debug")] &'stati
 /// and [`from_function`](crate::value::Value::from_function).  If you want
 /// to implement a custom callable, you can directly implement
 /// [`Object::call`] which is what the engine actually uses internally.
+///
+/// This trait is also used for [`filters`](crate::filters) and
+/// [`tests`](crate::tests).
 ///
 /// # Basic Example
 ///
@@ -159,6 +165,30 @@ pub(crate) struct BoxedFunction(Arc<FuncFunc>, #[cfg(feature = "debug")] &'stati
 /// {{ include_file("filename.txt") }}
 /// ```
 ///
+/// # Mutable State
+///
+/// A function which needs to modify the execution state can take `&mut State`
+/// as its first parameter.  Unlike `&State`, mutable state must be the first
+/// parameter and can only be requested once.
+///
+/// ```rust
+/// # use minijinja::Environment;
+/// use minijinja::{State, Value};
+///
+/// fn counter(state: &mut State) -> i64 {
+///     let value = state
+///         .get_temp("counter")
+///         .and_then(|value| i64::try_from(value).ok())
+///         .unwrap_or_default()
+///         + 1;
+///     state.set_temp("counter", Value::from(value));
+///     value
+/// }
+///
+/// # let mut env = Environment::new();
+/// env.add_function("counter", counter);
+/// ```
+///
 /// # Variadic
 ///
 /// ```
@@ -176,24 +206,70 @@ pub(crate) struct BoxedFunction(Arc<FuncFunc>, #[cfg(feature = "debug")] &'stati
 /// ```jinja
 /// {{ sum(1, 2, 3) }} -> 6
 /// ```
-pub trait Function<Rv, Args>: Send + Sync + 'static {
+///
+/// # Optional Arguments
+///
+/// ```
+/// # use minijinja::Environment;
+/// # let mut env = Environment::new();
+/// fn substr(value: String, start: u32, end: Option<u32>) -> String {
+///     let end = end.unwrap_or(value.len() as _);
+///     value.get(start as usize..end as usize).unwrap_or_default().into()
+/// }
+///
+/// env.add_filter("substr", substr);
+/// ```
+///
+/// ```jinja
+/// {{ "Foo Bar Baz"|substr(4) }} -> Bar Baz
+/// {{ "Foo Bar Baz"|substr(4, 7) }} -> Bar
+/// ```
+pub trait Function<Rv, Args: for<'a> FunctionArgs<'a>>: Send + Sync + 'static {
     /// Calls a function with the given arguments.
     #[doc(hidden)]
-    fn invoke(&self, args: Args, _: SealedMarker) -> Rv;
+    fn invoke<'a>(
+        &self,
+        state: &'a mut State,
+        values: &'a [Value],
+        _: SealedMarker,
+    ) -> Result<Value, Error>;
+}
+
+// This is necessary to avoid a bug in the trait solver. See
+// https://github.com/mitsuhiko/minijinja/pull/787 for more details.
+trait FunctionHelper<Rv, Args> {
+    fn invoke_nested(&self, args: Args) -> Rv;
 }
 
 macro_rules! tuple_impls {
     ( $( $name:ident )* ) => {
-        impl<Func, Rv, $($name),*> Function<Rv, ($($name,)*)> for Func
+        impl<Func, Rv, $($name),*> FunctionHelper<Rv, ($($name,)*)> for Func
         where
-            Func: Fn($($name),*) -> Rv + Send + Sync + 'static,
-            Rv: FunctionResult,
-            $($name: for<'a> ArgType<'a>,)*
+            Func: Fn($($name),*) -> Rv
         {
-            fn invoke(&self, args: ($($name,)*), _: SealedMarker) -> Rv {
+            fn invoke_nested(&self, args: ($($name,)*)) -> Rv {
                 #[allow(non_snake_case)]
                 let ($($name,)*) = args;
                 (self)($($name,)*)
+            }
+        }
+
+        impl<Func, Rv, $($name),*> Function<Rv, ($($name,)*)> for Func
+        where
+            Func: Send + Sync + 'static,
+            // the crazy bounds here exist to enable borrowing in closures
+            Func: Fn($($name),*) -> Rv + for<'a> FunctionHelper<Rv, ($(<$name as ArgType<'a>>::Output,)*)>,
+            Rv: FunctionResult,
+            $($name: for<'a> ArgType<'a>,)*
+        {
+            fn invoke<'a>(
+                &self,
+                state: &'a mut State,
+                values: &'a [Value],
+                _: SealedMarker,
+            ) -> Result<Value, Error> {
+                self.invoke_nested(ok!(<($($name,)*)>::from_values(Some(state), values)))
+                    .into_result()
             }
         }
     };
@@ -206,27 +282,83 @@ tuple_impls! { A B C }
 tuple_impls! { A B C D }
 tuple_impls! { A B C D E }
 
+/// Internal argument marker for functions receiving mutable state.
+#[doc(hidden)]
+pub struct FunctionArgsWithMutState<Args>(PhantomData<fn() -> Args>);
+
+impl<'a, Args> FunctionArgs<'a> for FunctionArgsWithMutState<Args>
+where
+    Args: FunctionArgs<'a>,
+{
+    type Output = Args::Output;
+
+    fn from_values(state: Option<&'a State>, values: &'a [Value]) -> Result<Self::Output, Error> {
+        Args::from_values(state, values)
+    }
+
+    fn from_values_mut(state: Option<&State>, values: &'a [Value]) -> Result<Self::Output, Error> {
+        Args::from_values_mut(state, values)
+    }
+}
+
+trait FunctionMutHelper<Rv, Args> {
+    fn invoke_nested_mut(&self, state: &mut State<'_, '_>, args: Args) -> Rv;
+}
+
+macro_rules! tuple_mut_impls {
+    ( $( $name:ident )* ) => {
+        impl<Func, Rv, $($name),*> FunctionMutHelper<Rv, ($($name,)*)> for Func
+        where
+            Func: Fn(&mut State<'_, '_>, $($name),*) -> Rv
+        {
+            fn invoke_nested_mut(&self, state: &mut State<'_, '_>, args: ($($name,)*)) -> Rv {
+                #[allow(non_snake_case)]
+                let ($($name,)*) = args;
+                (self)(state, $($name),*)
+            }
+        }
+
+        impl<Func, Rv, $($name),*> Function<Rv, FunctionArgsWithMutState<($($name,)*)>> for Func
+        where
+            Func: Send + Sync + 'static,
+            // the crazy bounds here exist to enable borrowing in closures
+            Func: Fn(&mut State<'_, '_>, $($name),*) -> Rv
+                + for<'a> FunctionMutHelper<Rv, ($(<$name as ArgType<'a>>::Output,)*)>,
+            Rv: FunctionResult,
+            $($name: for<'a> ArgType<'a>,)*
+        {
+            fn invoke<'a>(
+                &self,
+                state: &'a mut State,
+                values: &'a [Value],
+                _: SealedMarker,
+            ) -> Result<Value, Error> {
+                let args = ok!(<($($name,)*)>::from_values_mut(Some(state), values));
+                self.invoke_nested_mut(state, args).into_result()
+            }
+        }
+    };
+}
+
+tuple_mut_impls! {}
+tuple_mut_impls! { A }
+tuple_mut_impls! { A B }
+tuple_mut_impls! { A B C }
+tuple_mut_impls! { A B C D }
+
 impl BoxedFunction {
     /// Creates a new boxed filter.
     pub fn new<F, Rv, Args>(f: F) -> BoxedFunction
     where
-        F: Function<Rv, Args> + for<'a> Function<Rv, <Args as FunctionArgs<'a>>::Output>,
+        F: Function<Rv, Args>,
         Rv: FunctionResult,
         Args: for<'a> FunctionArgs<'a>,
     {
         BoxedFunction(
-            Arc::new(move |state, args| -> Result<Value, Error> {
-                f.invoke(ok!(Args::from_values(Some(state), args)), SealedMarker)
-                    .into_result()
-            }),
+            Arc::new(move |state, args| f.invoke(state, args, SealedMarker)),
             #[cfg(feature = "debug")]
             std::any::type_name::<F>(),
         )
-    }
-
-    /// Invokes the function.
-    pub fn invoke(&self, state: &State, args: &[Value]) -> Result<Value, Error> {
-        (self.0)(state, args)
     }
 
     /// Creates a value from a boxed function.
@@ -252,13 +384,15 @@ impl Object for BoxedFunction {
         ObjectRepr::Plain
     }
 
-    fn call(self: &Arc<Self>, state: &State, args: &[Value]) -> Result<Value, Error> {
-        self.invoke(state, args)
+    fn call(self: &Arc<Self>, state: &mut State, args: &[Value]) -> Result<Value, Error> {
+        (self.0)(state, args)
     }
 }
 
 #[cfg(feature = "builtins")]
 mod builtins {
+    use std::cmp::Ordering;
+
     use super::*;
 
     use crate::error::ErrorKind;
@@ -281,8 +415,8 @@ mod builtins {
     ///
     /// This function will refuse to create ranges over 10.000 items.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn range(lower: u32, upper: Option<u32>, step: Option<u32>) -> Result<Value, Error> {
-        fn to_result<I: ExactSizeIterator<Item = u32> + Send + Sync + Clone + 'static>(
+    pub fn range(lower: isize, upper: Option<isize>, step: Option<isize>) -> Result<Value, Error> {
+        fn to_result<I: ExactSizeIterator<Item = isize> + Send + Sync + Clone + 'static>(
             i: I,
         ) -> Result<Value, Error> {
             if i.len() > 100000 {
@@ -299,17 +433,34 @@ mod builtins {
             Some(upper) => lower..upper,
             None => 0..lower,
         };
-        if let Some(step) = step {
-            if step == 0 {
-                Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    "cannot create range with step of 0",
-                ))
-            } else {
-                to_result(rng.step_by(step as usize))
+
+        let Some(step) = step else {
+            return to_result(rng);
+        };
+
+        match step.cmp(&0) {
+            Ordering::Equal => Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "cannot create range with step of 0",
+            )),
+            Ordering::Greater => to_result(rng.step_by(step as usize)),
+            Ordering::Less => {
+                // handle negative steps
+                debug_assert!(step < 0);
+                let (start, end) = match upper {
+                    Some(upper) => (lower, upper),
+                    None => (0, lower),
+                };
+
+                let len = if start <= end {
+                    0
+                } else {
+                    ((start - end + (-step) - 1) / (-step)) as usize
+                };
+
+                let iter = (0..len).map(move |i| start + (i as isize) * step);
+                to_result(iter)
             }
-        } else {
-            to_result(rng)
         }
     }
 
@@ -336,7 +487,7 @@ mod builtins {
         let mut rv = match value {
             None => ValueMap::default(),
             Some(value) => match value.0 {
-                ValueRepr::Undefined => ValueMap::default(),
+                ValueRepr::Undefined(_) => ValueMap::default(),
                 ValueRepr::Object(obj) if obj.repr() == ObjectRepr::Map => {
                     obj.try_iter_pairs().into_iter().flatten().collect()
                 }
@@ -390,9 +541,10 @@ mod builtins {
     /// to an outer scope. Initial values can be provided as a dict, as keyword arguments,
     /// or both (same behavior as [`dict`]).
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn namespace(defaults: Option<Value>) -> Result<Value, Error> {
+    pub fn namespace(defaults: Option<crate::value::ValueOrKwargs>) -> Result<Value, Error> {
         let ns = crate::value::namespace_object::Namespace::default();
         if let Some(defaults) = defaults {
+            let defaults = defaults.into_value();
             if let Some(pairs) = defaults
                 .as_object()
                 .filter(|x| matches!(x.repr(), ObjectRepr::Map))

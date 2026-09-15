@@ -2,10 +2,8 @@
   <img src="https://github.com/mitsuhiko/minijinja/raw/main/artwork/logo.png" alt="" width=320>
   <p><strong>MiniJinja for Python: a powerful template engine for Rust and Python</strong></p>
 
-[![Build Status](https://github.com/mitsuhiko/minijinja/workflows/Tests/badge.svg?branch=main)](https://github.com/mitsuhiko/minijinja/actions?query=workflow%3ATests)
 [![License](https://img.shields.io/github/license/mitsuhiko/minijinja)](https://github.com/mitsuhiko/minijinja/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/d/minijinja.svg)](https://crates.io/crates/minijinja)
-[![rustc 1.61.0](https://img.shields.io/badge/rust-1.61%2B-orange.svg)](https://img.shields.io/badge/rust-1.61%2B-orange.svg)
 [![Documentation](https://docs.rs/minijinja/badge.svg)](https://docs.rs/minijinja)
 
 </div>
@@ -158,8 +156,8 @@ Here is what this means for some basic types:
 
 * Python dictionaries and lists (as well as other objects that behave as sequences)
   appear in the MiniJinja side very similar to how they do in Python.
-* Tuples on the MiniJinja side are represented as lists, but will appear again as
-  tuples if passed back to Python.
+* Python tuples appear as tuples in MiniJinja, use Python-compatible tuple rendering,
+  and remain tuples when passed back to Python. Lists remain distinct from tuples.
 * Python objects are represented in MiniJinja similarly to dicts, but they retain all
   their meaningful Python APIs.  This means they stringify via `__str__` and they
   allow the MiniJinja code to call their non-underscored methods.  Note that there is
@@ -173,6 +171,20 @@ Here is what this means for some basic types:
   be used to disambiugate properties and keys, in MiniJinja there is no such difference.
   However methods are disambiugated so `foo.items()` works and will correctly call
   the method in all cases.
+* Operator overloading is not supported.  This in particular means that operators like
+  `+` will not invoke the `__add__` method of most objects.  This is an intentional
+  limitation of the engine.
+* When MiniJinja objects are exposed to the Python side they lose most of their
+  functionality.  For instance plain objects such as functions are currently
+  just represented as strings, maps are dictionaries etc.  This also means you
+  cannot call methods on them from the Python side.
+
+## Threading
+
+MiniJinja's Python bindin is thread-safe but it uses locks internally on the
+environment.  In particular only one thread can render a template from the same
+environment at the time.  If you want to render templates from multiple threads
+you should be creating a new environment for each thread.
 
 ## Sponsor
 

@@ -7,8 +7,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::vendor::self_cell::self_cell;
 use memo_map::MemoMap;
-use self_cell::self_cell;
 
 use crate::compiler::instructions::Instructions;
 use crate::error::{Error, ErrorKind};
@@ -31,7 +31,7 @@ pub(crate) struct LoaderStore<'source> {
     borrowed_templates: BTreeMap<&'source str, Arc<CompiledTemplate<'source>>>,
 }
 
-impl<'source> fmt::Debug for LoaderStore<'source> {
+impl fmt::Debug for LoaderStore<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut l = f.debug_list();
         for key in self.owned_templates.keys() {
@@ -204,15 +204,13 @@ pub fn safe_join(base: &Path, template: &str) -> Option<PathBuf> {
 ///     env
 /// }
 /// ```
-#[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
 pub fn path_loader<'x, P: AsRef<Path> + 'x>(
     dir: P,
 ) -> impl for<'a> Fn(&'a str) -> Result<Option<String>, Error> + Send + Sync + 'static {
     let dir = dir.as_ref().to_path_buf();
     move |name| {
-        let path = match safe_join(&dir, name) {
-            Some(path) => path,
-            None => return Ok(None),
+        let Some(path) = safe_join(&dir, name) else {
+            return Ok(None);
         };
         match fs::read_to_string(path) {
             Ok(result) => Ok(Some(result)),

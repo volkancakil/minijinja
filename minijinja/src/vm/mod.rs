@@ -1,35 +1,40 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+#[cfg(feature = "macros")]
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::compiler::instructions::{
-    Instruction, Instructions, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
+    CompareOp, Instruction, Instructions, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
 };
 use crate::environment::Environment;
 use crate::error::{Error, ErrorKind};
 use crate::output::{CaptureMode, Output};
-use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
+use crate::utils::{untrusted_size_hint, write_escaped, AutoEscape, UndefinedBehavior};
 use crate::value::namespace_object::Namespace;
-use crate::value::{ops, value_map_with_capacity, value_optimization, Kwargs, Value};
-use crate::vm::context::{Frame, LoopState, Stack};
-use crate::vm::loop_object::Loop;
-use crate::vm::state::BlockStack;
-
-#[cfg(feature = "macros")]
-use crate::vm::closure_object::Closure;
+use crate::value::{
+    ops, value_map_with_capacity, Kwargs, ObjectRepr, UndefinedType, Value, ValueMap, ValueRepr,
+};
+use crate::vm::context::{Frame, Stack};
+use crate::vm::loop_object::{Loop, LoopState};
+#[cfg(feature = "multi_template")]
+use crate::vm::state::{BlockStack, BlockState};
 
 pub(crate) use crate::vm::context::Context;
 pub use crate::vm::state::State;
 
 #[cfg(feature = "macros")]
-mod closure_object;
+type ClosureId = usize;
+#[cfg(feature = "macros")]
+type Closure<'env> = BTreeMap<&'env str, Value>;
+
 mod context;
 #[cfg(feature = "fuel")]
 mod fuel;
 mod loop_object;
 #[cfg(feature = "macros")]
 mod macro_object;
+#[cfg(feature = "multi_template")]
+mod module_object;
 mod state;
 
 // the cost of a single include against the stack limit.
@@ -40,12 +45,9 @@ const INCLUDE_RECURSION_COST: usize = 10;
 #[cfg(feature = "macros")]
 const MACRO_RECURSION_COST: usize = 4;
 
-/// Helps to evaluate something.
-#[cfg_attr(feature = "internal_debug", derive(Debug))]
-pub struct Vm<'env> {
-    env: &'env Environment<'env>,
-}
+struct Executor<'env>(std::marker::PhantomData<&'env Environment<'env>>);
 
+#[cfg(feature = "multi_template")]
 pub(crate) fn prepare_blocks<'env, 'template>(
     blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
 ) -> BTreeMap<&'env str, BlockStack<'template, 'env>> {
@@ -55,135 +57,183 @@ pub(crate) fn prepare_blocks<'env, 'template>(
         .collect()
 }
 
-fn get_or_lookup_local<T, F>(vec: &mut [Option<T>], local_id: u8, f: F) -> Option<T>
+fn get_or_lookup_local<'a, F>(vec: &mut [Option<&'a Value>], idx: u8, f: F) -> Option<&'a Value>
 where
-    T: Copy,
-    F: FnOnce() -> Option<T>,
+    F: FnOnce() -> Option<&'a Value>,
 {
-    if local_id == !0 {
+    if idx == !0 {
         f()
-    } else if let Some(Some(rv)) = vec.get(local_id as usize) {
+    } else if let Some(Some(rv)) = vec.get(idx as usize) {
         Some(*rv)
     } else {
         let val = some!(f());
-        vec[local_id as usize] = Some(val);
+        vec[idx as usize] = Some(val);
         Some(val)
     }
 }
 
-impl<'env> Vm<'env> {
-    /// Creates a new VM.
-    pub fn new(env: &'env Environment<'env>) -> Vm<'env> {
-        Vm { env }
+fn normalize_filter_test_name(name: &str) -> Cow<'_, str> {
+    if name.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+        let mut normalized = String::with_capacity(name.len());
+        normalized.extend(name.chars().filter(|c| !c.is_ascii_whitespace()));
+        Cow::Owned(normalized)
+    } else {
+        Cow::Borrowed(name)
     }
+}
 
-    /// Evaluates the given inputs.
-    ///
-    /// It returns both the last value left on the stack as well as the state
-    /// at the end of the evaluation.
-    pub fn eval<'template>(
-        &self,
+pub(crate) fn eval<'env, 'template>(
+    env: &'env Environment<'env>,
+    instructions: &'template Instructions<'env>,
+    root: Value,
+    blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
+    out: &mut Output,
+    auto_escape: AutoEscape,
+) -> Result<(Option<Value>, State<'template, 'env>), Error> {
+    Executor::eval(env, instructions, root, blocks, out, auto_escape)
+}
+
+#[cfg(feature = "multi_template")]
+pub(crate) fn call_block<'env>(
+    name: &str,
+    state: &mut State<'_, 'env>,
+    out: &mut Output,
+) -> Result<Option<Value>, Error> {
+    Executor::call_block(name, state, out)
+}
+
+#[cfg(feature = "macros")]
+pub(crate) fn eval_macro<'env, 'template>(
+    state: &mut State<'template, 'env>,
+    instructions_id: usize,
+    pc: u32,
+    out: &mut Output,
+    closure: Option<ClosureId>,
+    caller: Option<Value>,
+    args: Vec<Value>,
+) -> Result<Option<Value>, Error> {
+    Executor::eval_macro(state, instructions_id, pc, out, closure, caller, args)
+}
+
+impl<'env> Executor<'env> {
+    pub(crate) fn eval<'template>(
+        env: &'env Environment<'env>,
         instructions: &'template Instructions<'env>,
         root: Value,
-        blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
+        _blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
         out: &mut Output,
         auto_escape: AutoEscape,
     ) -> Result<(Option<Value>, State<'template, 'env>), Error> {
-        let _guard = value_optimization();
         let mut state = State::new(
-            self.env,
-            Context::new_with_frame(ok!(Frame::new_checked(root)), self.env.recursion_limit()),
+            Context::new_with_frame(env, ok!(Frame::new_checked(root))),
             auto_escape,
             instructions,
-            prepare_blocks(blocks),
+            #[cfg(feature = "multi_template")]
+            prepare_blocks(_blocks),
         );
-        self.eval_state(&mut state, out).map(|x| (x, state))
+        Self::eval_state(&mut state, out).map(|x| (x, state))
     }
 
-    /// Evaluate a macro in a state.
+    /// Evaluates a macro by temporarily switching the active state.
     #[cfg(feature = "macros")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn eval_macro(
-        &self,
-        instructions: &Instructions<'env>,
-        pc: usize,
-        closure: Value,
-        context_base: Value,
-        caller: Option<Value>,
+    pub(crate) fn eval_macro<'template>(
+        state: &mut State<'template, 'env>,
+        instructions_id: usize,
+        pc: u32,
         out: &mut Output,
-        state: &State,
+        closure: Option<ClosureId>,
+        caller: Option<Value>,
         args: Vec<Value>,
     ) -> Result<Option<Value>, Error> {
-        let mut ctx = Context::new_with_frame(Frame::new(context_base), self.env.recursion_limit());
-        ok!(ctx.push_frame(Frame::new(closure)));
-        if let Some(caller) = caller {
-            ctx.store("caller", caller);
+        let instructions = *state
+            .macro_instructions
+            .get(&instructions_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "cannot call this macro. template state went away.",
+                )
+            })?;
+        let context_base = state.ctx.clone_base();
+        let mut ctx = state
+            .macro_context_pool
+            .pop()
+            .unwrap_or_else(|| Context::new(state.env()));
+        ctx.reset_with_frame(Frame::new(context_base));
+        let closure_frame = Frame {
+            closure_context: closure,
+            ..Frame::default()
+        };
+        if let Err(err) = ctx.push_frame(closure_frame) {
+            ctx.clear();
+            state.macro_context_pool.push(ctx);
+            return Err(err);
         }
-        ok!(ctx.incr_depth(state.ctx.depth() + MACRO_RECURSION_COST));
-        self.do_eval(
-            &mut State {
-                env: self.env,
-                ctx,
-                current_block: None,
-                auto_escape: state.auto_escape(),
-                instructions,
-                blocks: BTreeMap::default(),
-                loaded_templates: Default::default(),
-                #[cfg(feature = "macros")]
-                id: state.id,
-                #[cfg(feature = "macros")]
-                macros: state.macros.clone(),
-                #[cfg(feature = "macros")]
-                closure_tracker: state.closure_tracker.clone(),
-                #[cfg(feature = "fuel")]
-                fuel_tracker: state.fuel_tracker.clone(),
-            },
-            out,
-            Stack::from(args),
-            pc,
-        )
+        if let Some(caller) = caller {
+            ctx.store(&mut state.closures, "caller", caller);
+        }
+        if let Err(err) = ctx.incr_depth(state.ctx.depth() + MACRO_RECURSION_COST) {
+            ctx.clear();
+            state.macro_context_pool.push(ctx);
+            return Err(err);
+        }
+
+        let old_ctx = mem::replace(&mut state.ctx, ctx);
+        let auto_escape = state.auto_escape;
+        let rv = state.with_execution_state(
+            instructions,
+            auto_escape,
+            #[cfg(feature = "multi_template")]
+            None,
+            #[cfg(feature = "multi_template")]
+            BlockState::Isolate,
+            |state| Self::do_eval(state, out, Stack::from(args), pc),
+        );
+
+        let mut macro_ctx = mem::replace(&mut state.ctx, old_ctx);
+        macro_ctx.clear();
+        state.macro_context_pool.push(macro_ctx);
+        rv
     }
 
     /// This is the actual evaluation loop that works with a specific context.
     #[inline(always)]
-    fn eval_state(
-        &self,
-        state: &mut State<'_, 'env>,
-        out: &mut Output,
-    ) -> Result<Option<Value>, Error> {
-        self.do_eval(state, out, Stack::default(), 0)
+    fn eval_state(state: &mut State<'_, 'env>, out: &mut Output) -> Result<Option<Value>, Error> {
+        Self::do_eval(state, out, Stack::default(), 0)
     }
 
     /// Performs the actual evaluation, optionally with stack growth functionality.
     fn do_eval(
-        &self,
         state: &mut State<'_, 'env>,
         out: &mut Output,
         stack: Stack,
-        pc: usize,
+        pc: u32,
     ) -> Result<Option<Value>, Error> {
         #[cfg(feature = "stacker")]
         {
             stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-                self.eval_impl(state, out, stack, pc)
+                Self::eval_impl(state, out, stack, pc)
             })
         }
         #[cfg(not(feature = "stacker"))]
         {
-            self.eval_impl(state, out, stack, pc)
+            Self::eval_impl(state, out, stack, pc)
         }
     }
 
     #[inline]
     fn eval_impl(
-        &self,
         state: &mut State<'_, 'env>,
         out: &mut Output,
         mut stack: Stack,
-        mut pc: usize,
+        mut pc: u32,
     ) -> Result<Option<Value>, Error> {
         let initial_auto_escape = state.auto_escape;
         let undefined_behavior = state.undefined_behavior();
+        let strict_undefined = matches!(
+            undefined_behavior,
+            UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict
+        );
         let mut auto_escape_stack = vec![];
         let mut next_loop_recursion_jump = None;
         let mut loaded_filters = [None; MAX_LOCALS];
@@ -196,8 +246,13 @@ impl<'env> Vm<'env> {
         let mut parent_instructions = None;
 
         macro_rules! recurse_loop {
-            ($capture:expr) => {{
-                let jump_target = ctx_ok!(self.prepare_loop_recursion(state));
+            ($capture:expr, $loop_object:expr) => {{
+                let Some(jump_target) = $loop_object.recurse_jump_target else {
+                    bail!(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "cannot recurse outside of recursive loop",
+                    ))
+                };
                 // the way this works is that we remember the next instruction
                 // as loop exit jump target.  Whenever a loop is pushed, it
                 // memorizes the value in `next_loop_iteration_jump` to jump
@@ -242,9 +297,10 @@ impl<'env> Vm<'env> {
 
             // if we only have two arguments that we pull from the stack, we
             // can assign them to a and b.  This slightly reduces the amount of
-            // code bloat generated here.
+            // code bloat generated here.  Same with the error.
             let a;
             let b;
+            let mut err;
 
             macro_rules! func_binop {
                 ($method:ident) => {{
@@ -258,13 +314,15 @@ impl<'env> Vm<'env> {
                 ($op:tt) => {{
                     b = stack.pop();
                     a = stack.pop();
+                    ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                    ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     stack.push(Value::from(a $op b));
                 }};
             }
 
             macro_rules! bail {
                 ($err:expr) => {{
-                    let mut err = $err;
+                    err = $err;
                     process_err(&mut err, pc, state);
                     return Err(err);
                 }};
@@ -292,14 +350,14 @@ impl<'env> Vm<'env> {
             // if the fuel consumption feature is enabled, track the fuel
             // consumption here.
             #[cfg(feature = "fuel")]
-            if let Some(ref tracker) = state.fuel_tracker {
+            if let Some(ref mut tracker) = state.fuel_tracker {
                 ctx_ok!(tracker.track(instr));
             }
 
             match instr {
                 Instruction::Swap => {
-                    let a = stack.pop();
-                    let b = stack.pop();
+                    a = stack.pop();
+                    b = stack.pop();
                     stack.push(a);
                     stack.push(b);
                 }
@@ -309,10 +367,25 @@ impl<'env> Vm<'env> {
                     ok!(out.write_str(val).map_err(Error::from));
                 }
                 Instruction::Emit => {
-                    ctx_ok!(self.env.format(&stack.pop(), state, out));
+                    let value = stack.pop();
+                    if state.env().is_default_formatter() {
+                        if strict_undefined
+                            && matches!(value.0, ValueRepr::Undefined(UndefinedType::Default))
+                        {
+                            bail!(Error::from(ErrorKind::UndefinedError));
+                        }
+                        ctx_ok!(write_escaped(out, state.auto_escape, &value));
+                    } else {
+                        ctx_ok!(state.env().format(&value, state, out));
+                    }
                 }
                 Instruction::StoreLocal(name) => {
-                    state.ctx.store(name, stack.pop());
+                    state.ctx.store(
+                        #[cfg(feature = "macros")]
+                        &mut state.closures,
+                        name,
+                        stack.pop(),
+                    );
                 }
                 Instruction::Lookup(name) => {
                     stack.push(assert_valid!(state
@@ -366,21 +439,28 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::BuildMap(pair_count) => {
                     let mut map = value_map_with_capacity(*pair_count);
+                    stack.reverse_top(*pair_count * 2);
                     for _ in 0..*pair_count {
-                        let value = stack.pop();
                         let key = stack.pop();
+                        let value = stack.pop();
                         map.insert(key, value);
                     }
                     stack.push(Value::from_object(map))
                 }
                 Instruction::BuildKwargs(pair_count) => {
                     let mut map = value_map_with_capacity(*pair_count);
+                    stack.reverse_top(*pair_count * 2);
                     for _ in 0..*pair_count {
-                        let value = stack.pop();
                         let key = stack.pop();
+                        let value = stack.pop();
                         map.insert(key, value);
                     }
                     stack.push(Kwargs::wrap(map))
+                }
+                Instruction::MergeKwargs(count) => {
+                    let mut kwargs_sources = Vec::from_iter((0..*count).map(|_| stack.pop()));
+                    kwargs_sources.reverse();
+                    stack.push(ctx_ok!(Self::merge_kwargs(state, kwargs_sources)));
                 }
                 Instruction::BuildList(n) => {
                     let count = n.unwrap_or_else(|| stack.pop().try_into().unwrap());
@@ -391,8 +471,40 @@ impl<'env> Vm<'env> {
                     v.reverse();
                     stack.push(Value::from_object(v))
                 }
+                Instruction::BuildTuple(n) => {
+                    use crate::value::Tuple;
+                    let count = n.unwrap_or_else(|| stack.pop().try_into().unwrap());
+                    let tuple = match count {
+                        0 => Tuple::default(),
+                        1 => Tuple::from([stack.pop()]),
+                        2 => {
+                            let second = stack.pop();
+                            Tuple::from([stack.pop(), second])
+                        }
+                        _ => {
+                            let mut values = Vec::with_capacity(untrusted_size_hint(count));
+                            for _ in 0..count {
+                                values.push(stack.pop());
+                            }
+                            values.reverse();
+                            Tuple::from(values)
+                        }
+                    };
+                    stack.push(Value::from(tuple))
+                }
                 Instruction::UnpackList(count) => {
-                    ctx_ok!(self.unpack_list(&mut stack, *count));
+                    ctx_ok!(Self::unpack_list(&mut stack, *count));
+                }
+                Instruction::UnpackLists(count) => {
+                    let lists = Vec::from_iter((0..*count).map(|_| stack.pop()));
+                    let mut len = 0;
+                    for list in lists.into_iter().rev() {
+                        for item in ctx_ok!(list.try_iter()) {
+                            stack.push(item);
+                            len += 1;
+                        }
+                    }
+                    stack.push(Value::from(len));
                 }
                 Instruction::Add => func_binop!(add),
                 Instruction::Sub => func_binop!(sub),
@@ -409,20 +521,71 @@ impl<'env> Vm<'env> {
                 Instruction::Lte => op_binop!(<=),
                 Instruction::Not => {
                     a = stack.pop();
-                    stack.push(Value::from(!a.is_true()));
+                    stack.push(Value::from(!ctx_ok!(undefined_behavior.is_true(&a))));
                 }
                 Instruction::StringConcat => {
                     a = stack.pop();
                     b = stack.pop();
+                    ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                    ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
                     stack.push(ops::string_concat(b, &a));
                 }
                 Instruction::In => {
                     a = stack.pop();
                     b = stack.pop();
-                    // the in-operator can fail if the value is undefined and
+                    // the in-operator can fail if either side is undefined and
                     // we are in strict mode.
                     ctx_ok!(state.undefined_behavior().assert_iterable(&a));
+                    ctx_ok!(state.undefined_behavior().assert_value_not_undefined(&b));
                     stack.push(ctx_ok!(ops::contains(&a, &b)));
+                }
+                Instruction::CompareAndPreserve(op) => {
+                    b = stack.pop();
+                    a = stack.pop();
+                    let result = match op {
+                        CompareOp::Eq => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a == b
+                        }
+                        CompareOp::Ne => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a != b
+                        }
+                        CompareOp::Lt => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a < b
+                        }
+                        CompareOp::Lte => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a <= b
+                        }
+                        CompareOp::Gt => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a > b
+                        }
+                        CompareOp::Gte => {
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
+                            a >= b
+                        }
+                        CompareOp::In | CompareOp::NotIn => {
+                            ctx_ok!(undefined_behavior.assert_iterable(&b));
+                            ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            let contains = ctx_ok!(ops::contains(&b, &a)).is_true();
+                            if matches!(op, CompareOp::NotIn) {
+                                !contains
+                            } else {
+                                contains
+                            }
+                        }
+                    };
+                    stack.push(b);
+                    stack.push(Value::from(result));
                 }
                 Instruction::Neg => {
                     a = stack.pop();
@@ -432,15 +595,16 @@ impl<'env> Vm<'env> {
                     ctx_ok!(state.ctx.push_frame(Frame::default()));
                 }
                 Instruction::PopFrame => {
-                    if let Some(mut loop_ctx) = state.ctx.pop_frame().current_loop {
-                        if let Some((target, end_capture)) = loop_ctx.current_recursion_jump.take()
-                        {
-                            pc = target;
-                            if end_capture {
-                                stack.push(out.end_capture(state.auto_escape));
-                            }
-                            continue;
+                    state.ctx.pop_frame();
+                }
+                Instruction::PopLoopFrame => {
+                    let mut l = state.ctx.pop_frame().current_loop.unwrap();
+                    if let Some((target, end_capture)) = l.current_recursion_jump.take() {
+                        pc = target;
+                        if end_capture {
+                            stack.push(out.end_capture(state.auto_escape));
                         }
+                        continue;
                     }
                 }
                 #[cfg(feature = "macros")]
@@ -450,27 +614,16 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::PushLoop(flags) => {
                     a = stack.pop();
-                    ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
+                    ctx_ok!(Self::push_loop(
+                        state,
+                        a,
+                        *flags,
+                        pc,
+                        next_loop_recursion_jump.take()
+                    ));
                 }
                 Instruction::Iterate(jump_target) => {
-                    let l = state.ctx.current_loop().unwrap();
-                    l.object.idx.fetch_add(1, Ordering::Relaxed);
-
-                    let next = {
-                        #[cfg(feature = "adjacent_loop_items")]
-                        {
-                            let mut triple = l.object.value_triple.lock().unwrap();
-                            triple.0 = triple.1.take();
-                            triple.1 = triple.2.take();
-                            triple.2 = l.iterator.next();
-                            triple.1.clone()
-                        }
-                        #[cfg(not(feature = "adjacent_loop_items"))]
-                        {
-                            l.iterator.next()
-                        }
-                    };
-                    match next {
+                    match state.ctx.next_loop_item() {
                         Some(item) => stack.push(assert_valid!(item)),
                         None => {
                             pc = *jump_target;
@@ -479,8 +632,9 @@ impl<'env> Vm<'env> {
                     };
                 }
                 Instruction::PushDidNotIterate => {
-                    let l = state.ctx.current_loop().unwrap();
-                    stack.push(Value::from(l.object.idx.load(Ordering::Relaxed) == 0));
+                    stack.push(Value::from(
+                        state.ctx.current_loop().unwrap().did_not_iterate(),
+                    ));
                 }
                 Instruction::Jump(jump_target) => {
                     pc = *jump_target;
@@ -488,13 +642,13 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::JumpIfFalse(jump_target) => {
                     a = stack.pop();
-                    if !ok!(undefined_behavior.is_true(&a)) {
+                    if !ctx_ok!(undefined_behavior.is_true(&a)) {
                         pc = *jump_target;
                         continue;
                     }
                 }
                 Instruction::JumpIfFalseOrPop(jump_target) => {
-                    if !ok!(undefined_behavior.is_true(stack.peek())) {
+                    if !ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
                     } else {
@@ -502,23 +656,17 @@ impl<'env> Vm<'env> {
                     }
                 }
                 Instruction::JumpIfTrueOrPop(jump_target) => {
-                    if ok!(undefined_behavior.is_true(stack.peek())) {
+                    if ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
                     } else {
                         stack.pop();
                     }
                 }
-                #[cfg(feature = "multi_template")]
-                Instruction::CallBlock(name) => {
-                    if parent_instructions.is_none() && !out.is_discarding() {
-                        self.call_block(name, state, out)?;
-                    }
-                }
                 Instruction::PushAutoEscape => {
                     a = stack.pop();
                     auto_escape_stack.push(state.auto_escape);
-                    state.auto_escape = ctx_ok!(self.derive_auto_escape(a, initial_auto_escape));
+                    state.auto_escape = ctx_ok!(Self::derive_auto_escape(a, initial_auto_escape));
                 }
                 Instruction::PopAutoEscape => {
                     state.auto_escape = auto_escape_stack.pop().unwrap();
@@ -530,75 +678,93 @@ impl<'env> Vm<'env> {
                     stack.push(out.end_capture(state.auto_escape));
                 }
                 Instruction::ApplyFilter(name, arg_count, local_id) => {
+                    let normalized_name = normalize_filter_test_name(name);
                     let filter =
                         ctx_ok!(get_or_lookup_local(&mut loaded_filters, *local_id, || {
-                            state.env.get_filter(name)
+                            state.env().get_filter(normalized_name.as_ref())
                         })
                         .ok_or_else(|| {
                             Error::new(
                                 ErrorKind::UnknownFilter,
-                                format!("filter {name} is unknown"),
+                                format!("filter {} is unknown", normalized_name.as_ref()),
                             )
                         }));
-                    let args = stack.slice_top(*arg_count);
-                    a = ctx_ok!(filter.apply_to(state, args));
-                    stack.drop_top(*arg_count);
+                    let args = stack.get_call_args(*arg_count);
+                    let arg_count = args.len();
+                    a = ctx_ok!(filter.call(state, args));
+                    stack.drop_top(arg_count);
                     stack.push(a);
                 }
                 Instruction::PerformTest(name, arg_count, local_id) => {
+                    let normalized_name = normalize_filter_test_name(name);
                     let test = ctx_ok!(get_or_lookup_local(&mut loaded_tests, *local_id, || {
-                        state.env.get_test(name)
+                        state.env().get_test(normalized_name.as_ref())
                     })
                     .ok_or_else(|| {
-                        Error::new(ErrorKind::UnknownTest, format!("test {name} is unknown"))
+                        Error::new(
+                            ErrorKind::UnknownTest,
+                            format!("test {} is unknown", normalized_name.as_ref()),
+                        )
                     }));
-                    let args = stack.slice_top(*arg_count);
-                    let rv = ctx_ok!(test.perform(state, args));
-                    stack.drop_top(*arg_count);
-                    stack.push(Value::from(rv));
+                    let args = stack.get_call_args(*arg_count);
+                    let arg_count = args.len();
+                    a = ctx_ok!(test.call(state, args));
+                    stack.drop_top(arg_count);
+                    stack.push(Value::from(a.is_true()));
                 }
                 Instruction::CallFunction(name, arg_count) => {
+                    let args = stack.get_call_args(*arg_count);
                     // super is a special function reserved for super-ing into blocks.
-                    if *name == "super" {
-                        if *arg_count != 0 {
-                            bail!(Error::new(
-                                ErrorKind::InvalidOperation,
-                                "super() takes no arguments",
-                            ));
+                    let rv = if cfg!(feature = "multi_template") && *name == "super" {
+                        #[cfg(feature = "multi_template")]
+                        {
+                            if !args.is_empty() {
+                                bail!(Error::new(
+                                    ErrorKind::InvalidOperation,
+                                    "super() takes no arguments",
+                                ));
+                            }
+                            ctx_ok!(Self::perform_super(state, out, true))
                         }
-                        stack.push(ctx_ok!(self.perform_super(state, out, true)));
-                    // loop is a special name which when called recurses the current loop.
-                    } else if *name == "loop" {
-                        if *arg_count != 1 {
-                            bail!(Error::new(
-                                ErrorKind::InvalidOperation,
-                                format!("loop() takes one argument, got {}", *arg_count)
-                            ));
-                        }
-                        // leave the one argument on the stack for the recursion
-                        recurse_loop!(true);
+                        #[cfg(not(feature = "multi_template"))]
+                        unreachable!()
                     } else if let Some(func) = state.lookup(name) {
-                        let args = stack.slice_top(*arg_count);
-                        a = ctx_ok!(func.call(state, args));
-                        stack.drop_top(*arg_count);
-                        stack.push(a);
+                        // calling loops is a special operation that starts the recursion process.
+                        // this bypasses the actual `call` implementation which would just fail
+                        // with an error.
+                        if let Some(loop_object) = func.downcast_object_ref::<Loop>() {
+                            if args.len() != 1 {
+                                bail!(Error::new(
+                                    ErrorKind::InvalidOperation,
+                                    "loop() takes one argument"
+                                ));
+                            }
+                            recurse_loop!(true, loop_object);
+                        } else {
+                            ctx_ok!(func.call(state, args))
+                        }
                     } else {
                         bail!(Error::new(
                             ErrorKind::UnknownFunction,
                             format!("{name} is unknown"),
                         ));
-                    }
+                    };
+                    let arg_count = args.len();
+                    stack.drop_top(arg_count);
+                    stack.push(rv);
                 }
                 Instruction::CallMethod(name, arg_count) => {
-                    let args = stack.slice_top(*arg_count);
+                    let args = stack.get_call_args(*arg_count);
+                    let arg_count = args.len();
                     a = ctx_ok!(args[0].call_method(state, name, &args[1..]));
-                    stack.drop_top(*arg_count);
+                    stack.drop_top(arg_count);
                     stack.push(a);
                 }
                 Instruction::CallObject(arg_count) => {
-                    let args = stack.slice_top(*arg_count);
+                    let args = stack.get_call_args(*arg_count);
+                    let arg_count = args.len();
                     a = ctx_ok!(args[0].call(state, &args[1..]));
-                    stack.drop_top(*arg_count);
+                    stack.drop_top(arg_count);
                     stack.push(a);
                 }
                 Instruction::DupTop => {
@@ -607,12 +773,14 @@ impl<'env> Vm<'env> {
                 Instruction::DiscardTop => {
                     stack.pop();
                 }
+                #[cfg(feature = "multi_template")]
                 Instruction::FastSuper => {
-                    ctx_ok!(self.perform_super(state, out, false));
+                    ctx_ok!(Self::perform_super(state, out, false));
                 }
-                Instruction::FastRecurse => {
-                    recurse_loop!(false);
-                }
+                Instruction::FastRecurse => match state.ctx.current_loop() {
+                    Some(l) => recurse_loop!(false, &l.object),
+                    None => bail!(Error::new(ErrorKind::UnknownFunction, "loop is unknown")),
+                },
                 // Explanation on the behavior of `LoadBlocks` and rendering of
                 // inherited templates:
                 //
@@ -645,49 +813,52 @@ impl<'env> Vm<'env> {
                             "tried to extend a second time in a template"
                         ));
                     }
-                    parent_instructions = Some(ctx_ok!(self.load_blocks(a, state)));
+                    parent_instructions = Some(ctx_ok!(Self::load_blocks(a, state)));
                     out.begin_capture(CaptureMode::Discard);
                 }
                 #[cfg(feature = "multi_template")]
                 Instruction::Include(ignore_missing) => {
                     a = stack.pop();
-                    ctx_ok!(self.perform_include(a, state, out, *ignore_missing));
+                    ctx_ok!(Self::perform_include(a, state, out, *ignore_missing));
                 }
                 #[cfg(feature = "multi_template")]
                 Instruction::ExportLocals => {
+                    let captured = stack.pop();
                     let locals = state.ctx.current_locals_mut();
-                    let mut module = value_map_with_capacity(locals.len());
+                    let mut values = value_map_with_capacity(locals.len());
                     for (key, value) in locals.iter() {
-                        module.insert(Value::from(*key), value.clone());
+                        values.insert(Value::from(*key), value.clone());
                     }
-                    stack.push(Value::from_object(module));
+                    stack.push(Value::from_object(crate::vm::module_object::Module::new(
+                        values, captured,
+                    )));
+                }
+                #[cfg(feature = "multi_template")]
+                Instruction::CallBlock(name) => {
+                    if parent_instructions.is_none() && !out.is_discarding() {
+                        ctx_ok!(Self::call_block(name, state, out));
+                    }
                 }
                 #[cfg(feature = "macros")]
                 Instruction::BuildMacro(name, offset, flags) => {
-                    self.build_macro(&mut stack, state, *offset, name, *flags);
+                    Self::build_macro(&mut stack, state, *offset, name, *flags);
                 }
                 #[cfg(feature = "macros")]
                 Instruction::Return => break,
                 #[cfg(feature = "macros")]
                 Instruction::Enclose(name) => {
-                    // the first time we enclose a value, we need to create a closure
-                    // and store it on the context, and add it to the closure tracker
-                    // for cycle breaking.
+                    // The first enclosed value creates a state-owned closure shared
+                    // by all macros declared in this frame.
                     if state.ctx.closure().is_none() {
-                        let closure = Arc::new(Closure::default());
-                        state.closure_tracker.track_closure(closure.clone());
+                        let closure = state.closures.len();
+                        state.closures.push(Closure::new());
                         state.ctx.reset_closure(Some(closure));
                     }
-                    state.ctx.enclose(state.env, name);
+                    state.ctx.enclose(&mut state.closures, name);
                 }
                 #[cfg(feature = "macros")]
                 Instruction::GetClosure => {
-                    stack.push(
-                        state
-                            .ctx
-                            .closure()
-                            .map_or(Value::UNDEFINED, |x| Value::from_dyn_object(x.clone())),
-                    );
+                    stack.push(state.ctx.closure().map_or(Value::UNDEFINED, Value::from));
                 }
             }
             pc += 1;
@@ -696,9 +867,32 @@ impl<'env> Vm<'env> {
         Ok(stack.try_pop())
     }
 
+    fn merge_kwargs(state: &State, values: Vec<Value>) -> Result<Value, Error> {
+        let mut rv = ValueMap::new();
+        for value in values {
+            ok!(state.undefined_behavior().assert_iterable(&value));
+            let iter = ok!(value
+                .as_object()
+                .filter(|x| x.repr() == ObjectRepr::Map)
+                .and_then(|x| x.try_iter_pairs())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "attempted to apply keyword arguments from non map (got {})",
+                            value.kind()
+                        ),
+                    )
+                }));
+            for (key, value) in iter {
+                rv.insert(key, value);
+            }
+        }
+        Ok(Kwargs::wrap(rv))
+    }
+
     #[cfg(feature = "multi_template")]
     fn perform_include(
-        &self,
         name: Value,
         state: &mut State<'_, 'env>,
         out: &mut Output,
@@ -733,30 +927,20 @@ impl<'env> Vm<'env> {
             };
 
             let (new_instructions, new_blocks) = ok!(tmpl.instructions_and_blocks());
-            let old_escape = mem::replace(&mut state.auto_escape, tmpl.initial_auto_escape());
-            let old_instructions = mem::replace(&mut state.instructions, new_instructions);
-            let old_blocks = mem::replace(&mut state.blocks, prepare_blocks(new_blocks));
-            // we need to make a copy of the loaded templates here as we want
-            // to forget about the templates that an include triggered by the
-            // time the include finishes.
-            let old_loaded_templates = state.loaded_templates.clone();
             ok!(state.ctx.incr_depth(INCLUDE_RECURSION_COST));
-            let rv;
+            let current_block = state.current_block;
             #[cfg(feature = "macros")]
-            {
-                let old_closure = state.ctx.take_closure();
-                rv = self.eval_state(state, out);
-                state.ctx.reset_closure(old_closure);
-            }
-            #[cfg(not(feature = "macros"))]
-            {
-                rv = self.eval_state(state, out);
-            }
+            let old_closure = state.ctx.take_closure();
+            let rv = state.with_execution_state(
+                new_instructions,
+                tmpl.initial_auto_escape(),
+                current_block,
+                BlockState::Replace(prepare_blocks(new_blocks)),
+                |state| Self::eval_state(state, out),
+            );
+            #[cfg(feature = "macros")]
+            state.ctx.reset_closure(old_closure);
             state.ctx.decr_depth(INCLUDE_RECURSION_COST);
-            state.loaded_templates = old_loaded_templates;
-            state.auto_escape = old_escape;
-            state.instructions = old_instructions;
-            state.blocks = old_blocks;
             ok!(rv.map_err(|err| {
                 Error::new(
                     ErrorKind::BadInclude,
@@ -786,8 +970,8 @@ impl<'env> Vm<'env> {
         }
     }
 
+    #[cfg(feature = "multi_template")]
     fn perform_super(
-        &self,
         state: &mut State<'_, 'env>,
         out: &mut Output,
         capture: bool,
@@ -796,23 +980,32 @@ impl<'env> Vm<'env> {
             Error::new(ErrorKind::InvalidOperation, "cannot super outside of block")
         }));
 
-        let block_stack = state.blocks.get_mut(name).unwrap();
-        if !block_stack.push() {
+        if !state.blocks.get_mut(name).unwrap().push() {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
                 "no parent block exists",
             ));
         }
 
+        if let Err(err) = state.ctx.push_frame(Frame::default()) {
+            state.blocks.get_mut(name).unwrap().pop();
+            return Err(err);
+        }
         if capture {
             out.begin_capture(CaptureMode::Capture);
         }
 
-        let old_instructions = mem::replace(&mut state.instructions, block_stack.instructions());
-        ok!(state.ctx.push_frame(Frame::default()));
-        let rv = self.eval_state(state, out);
+        let instructions = state.blocks.get(name).unwrap().instructions();
+        let auto_escape = state.auto_escape;
+        let current_block = state.current_block;
+        let rv = state.with_execution_state(
+            instructions,
+            auto_escape,
+            current_block,
+            BlockState::Keep,
+            |state| Self::eval_state(state, out),
+        );
         state.ctx.pop_frame();
-        state.instructions = old_instructions;
         state.blocks.get_mut(name).unwrap().pop();
 
         ok!(rv.map_err(|err| {
@@ -825,38 +1018,16 @@ impl<'env> Vm<'env> {
         }
     }
 
-    fn prepare_loop_recursion(&self, state: &mut State) -> Result<usize, Error> {
-        if let Some(loop_ctx) = state.ctx.current_loop() {
-            if let Some(recurse_jump_target) = loop_ctx.recurse_jump_target {
-                Ok(recurse_jump_target)
-            } else {
-                Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    "cannot recurse outside of recursive loop",
-                ))
-            }
-        } else {
-            Err(Error::new(
-                ErrorKind::InvalidOperation,
-                "cannot recurse outside of loop",
-            ))
-        }
-    }
-
     #[cfg(feature = "multi_template")]
     fn load_blocks(
-        &self,
         name: Value,
         state: &mut State<'_, 'env>,
     ) -> Result<&'env Instructions<'env>, Error> {
-        let name = match name.as_str() {
-            Some(name) => name,
-            None => {
-                return Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    "template name was not a string",
-                ))
-            }
+        let Some(name) = name.as_str() else {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "template name was not a string",
+            ));
         };
         if state.loaded_templates.contains(&name) {
             return Err(Error::new(
@@ -879,31 +1050,38 @@ impl<'env> Vm<'env> {
 
     #[cfg(feature = "multi_template")]
     pub(crate) fn call_block(
-        &self,
         name: &str,
         state: &mut State<'_, 'env>,
         out: &mut Output,
     ) -> Result<Option<Value>, Error> {
         if let Some((name, block_stack)) = state.blocks.get_key_value(name) {
-            let old_block = mem::replace(&mut state.current_block, Some(name));
-            let old_instructions =
-                mem::replace(&mut state.instructions, block_stack.instructions());
-            state.ctx.push_frame(Frame::default())?;
-            let rv = self.eval_state(state, out);
-            state.ctx.pop_frame();
-            state.instructions = old_instructions;
-            state.current_block = old_block;
-            rv
+            if block_stack.len() == 1 && block_stack.instructions().is_required_block() {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("Required block '{name}' not found"),
+                ));
+            }
+            let instructions = block_stack.instructions();
+            let auto_escape = state.auto_escape;
+            state.with_execution_state(
+                instructions,
+                auto_escape,
+                Some(name),
+                BlockState::Keep,
+                |state| {
+                    ok!(state.ctx.push_frame(Frame::default()));
+                    Self::eval_state(state, out)
+                },
+            )
         } else {
             Err(Error::new(
                 ErrorKind::UnknownBlock,
-                format!("block '{}' not found", name),
+                format!("block '{name}' not found"),
             ))
         }
     }
 
     fn derive_auto_escape(
-        &self,
         value: Value,
         initial_auto_escape: AutoEscape,
     ) -> Result<AutoEscape, Error> {
@@ -925,51 +1103,52 @@ impl<'env> Vm<'env> {
     }
 
     fn push_loop(
-        &self,
         state: &mut State<'_, 'env>,
         iterable: Value,
         flags: u8,
-        pc: usize,
-        current_recursion_jump: Option<(usize, bool)>,
+        pc: u32,
+        current_recursion_jump: Option<(u32, bool)>,
     ) -> Result<(), Error> {
-        #[allow(unused_mut)]
-        let mut iterator = ok!(state.undefined_behavior().try_iter(iterable));
-        // for an iterator where the lower and upper bound are matching we can
-        // consider them to have ExactSizeIterator semantics.  We do however not
-        // expect ExactSizeIterator bounds themselves to support iteration by
-        // other means.
-        let len = match iterator.size_hint() {
-            (lower, Some(upper)) if lower == upper => Some(lower),
-            _ => None,
-        };
+        let iter = ok!(state
+            .undefined_behavior()
+            .try_iter(iterable)
+            .map_err(|mut err| {
+                if let Some((jump_instr, _)) = current_recursion_jump {
+                    // When a recursion error happens, we need to process the error at both the
+                    // recursion call site and the loop definition.  This is because the error
+                    // happens at the recursion call site, but the loop definition is where the
+                    // recursion is defined.  This helps provide a more helpful error message.
+                    // For better reporting we basically turn this around.  jump_pc - 1 is the
+                    // location of FastRecurse or CallFunction.
+                    process_err(&mut err, pc, state);
+                    let mut call_err = Error::new(
+                        ErrorKind::InvalidOperation,
+                        "cannot recurse because of non-iterable value",
+                    );
+                    process_err(&mut call_err, jump_instr - 1, state);
+                    call_err.with_source(err)
+                } else {
+                    err
+                }
+            }));
         let depth = state
             .ctx
             .current_loop()
-            .filter(|x| x.recurse_jump_target.is_some())
+            .filter(|x| x.object.recurse_jump_target.is_some())
             .map_or(0, |x| x.object.depth + 1);
-        let recursive = flags & LOOP_FLAG_RECURSIVE != 0;
-        let with_loop_var = flags & LOOP_FLAG_WITH_LOOP_VAR != 0;
-        ok!(state.ctx.push_frame(Frame {
-            current_loop: Some(LoopState {
-                with_loop_var,
-                recurse_jump_target: if recursive { Some(pc) } else { None },
+        state.ctx.push_frame(Frame {
+            current_loop: Some(LoopState::new(
+                iter,
+                depth,
+                flags & LOOP_FLAG_WITH_LOOP_VAR != 0,
+                (flags & LOOP_FLAG_RECURSIVE != 0).then_some(pc),
                 current_recursion_jump,
-                object: Arc::new(Loop {
-                    idx: AtomicUsize::new(!0usize),
-                    len,
-                    depth,
-                    #[cfg(feature = "adjacent_loop_items")]
-                    value_triple: Mutex::new((None, None, iterator.next())),
-                    last_changed_value: Mutex::default(),
-                }),
-                iterator,
-            }),
+            )),
             ..Frame::default()
-        }));
-        Ok(())
+        })
     }
 
-    fn unpack_list(&self, stack: &mut Stack, count: usize) -> Result<(), Error> {
+    fn unpack_list(stack: &mut Stack, count: usize) -> Result<(), Error> {
         let top = stack.pop();
         let iter = ok!(top
             .as_object()
@@ -988,30 +1167,27 @@ impl<'env> Vm<'env> {
         } else {
             Err(Error::new(
                 ErrorKind::CannotUnpack,
-                format!("sequence of wrong length (expected {}, got {})", count, n,),
+                format!("sequence of wrong length (expected {count}, got {n})",),
             ))
         }
     }
 
     #[cfg(feature = "macros")]
-    fn build_macro(
-        &self,
-        stack: &mut Stack,
-        state: &mut State,
-        offset: usize,
-        name: &str,
-        flags: u8,
-    ) {
+    fn build_macro(stack: &mut Stack, state: &mut State, offset: u32, name: &str, flags: u8) {
         use crate::{compiler::instructions::MACRO_CALLER, vm::macro_object::Macro};
 
         let arg_spec = stack.pop().try_iter().unwrap().collect();
-        let closure = stack.pop();
-        let macro_ref_id = state.macros.len();
-        Arc::make_mut(&mut state.macros).push((state.instructions, offset));
+        let closure = stack.pop().as_usize();
+        let instructions_id = state.instructions as *const Instructions<'_> as usize;
+        state
+            .macro_instructions
+            .entry(instructions_id)
+            .or_insert(state.instructions);
         stack.push(Value::from_object(Macro {
             name: Value::from(name),
             arg_spec,
-            macro_ref_id,
+            instructions_id,
+            offset,
             state_id: state.id,
             closure,
             caller_reference: (flags & MACRO_CALLER) != 0,
@@ -1021,7 +1197,7 @@ impl<'env> Vm<'env> {
 
 #[inline(never)]
 #[cold]
-fn process_err(err: &mut Error, pc: usize, state: &State) {
+fn process_err(err: &mut Error, pc: u32, state: &State) {
     // only attach line information if the error does not have line info yet.
     if err.line().is_none() {
         if let Some(span) = state.instructions.get_span(pc) {
@@ -1033,7 +1209,7 @@ fn process_err(err: &mut Error, pc: usize, state: &State) {
     // only attach debug info if we don't have one yet and we are in debug mode.
     #[cfg(feature = "debug")]
     {
-        if state.env.debug() && err.debug_info().is_none() {
+        if state.env().debug() && err.debug_info().is_none() {
             err.attach_debug_info(state.make_debug_info(pc, state.instructions));
         }
     }

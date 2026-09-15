@@ -1,20 +1,57 @@
+// The Unicode lookup test intentionally uses Greek alpha, which is visually
+// confusable with an ASCII identifier elsewhere in this test crate.
+#![allow(confusable_idents, mixed_script_confusables)]
 #![cfg(all(
     feature = "multi_template",
     feature = "macros",
     feature = "builtins",
     feature = "adjacent_loop_items",
+    feature = "custom_syntax",
     feature = "deserialization"
 ))]
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::fs;
 use std::sync::Arc;
-use std::{env, fs};
 
 use insta::assert_snapshot;
-use minijinja::value::{Enumerator, Object, ObjectRepr, Value};
-use minijinja::{context, render, Environment, Error, ErrorKind, State};
+use minijinja::syntax::SyntaxConfig;
+use minijinja::value::{Enumerator, Object, ObjectRepr, Rest, Serde, Value, ValueOrKwargs};
+use minijinja::{context, render, Environment, Error, ErrorKind, State, UndefinedBehavior};
 
+use serde::Deserialize;
 use similar_asserts::assert_eq;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TestSettings {
+    keep_trailing_newline: bool,
+    lstrip_blocks: bool,
+    trim_blocks: bool,
+    markers: Option<[String; 6]>,
+    line_statement_prefix: Option<String>,
+    line_comment_prefix: Option<String>,
+    undefined: Option<String>,
+}
+
+impl TestSettings {
+    pub fn into_syntax(self) -> SyntaxConfig {
+        let mut builder = SyntaxConfig::builder();
+        if let Some(ref markers) = self.markers {
+            builder
+                .block_delimiters(markers[0].to_string(), markers[1].to_string())
+                .variable_delimiters(markers[2].to_string(), markers[3].to_string())
+                .comment_delimiters(markers[4].to_string(), markers[5].to_string());
+        }
+        if let Some(prefix) = self.line_statement_prefix {
+            builder.line_statement_prefix(prefix);
+        }
+        if let Some(prefix) = self.line_comment_prefix {
+            builder.line_comment_prefix(prefix);
+        }
+        builder.build().unwrap()
+    }
+}
 
 #[test]
 fn test_vm() {
@@ -36,7 +73,26 @@ fn test_vm() {
         let contents = std::fs::read_to_string(path).unwrap();
         let mut iter = contents.splitn(2, "\n---\n");
         let mut env = Environment::new();
+        env.add_function("get_args", |args: Rest<ValueOrKwargs>| -> Value {
+            Value::from(args.into_values())
+        });
         let ctx: Value = serde_json::from_str(iter.next().unwrap()).unwrap();
+        let settings =
+            if let Some(settings) = ctx.get_attr("$settings").ok().filter(|x| !x.is_undefined()) {
+                TestSettings::deserialize(settings).unwrap()
+            } else {
+                TestSettings::default()
+            };
+        env.set_undefined_behavior(match settings.undefined.as_deref() {
+            Some("strict") => UndefinedBehavior::Strict,
+            Some("lenient") | None => UndefinedBehavior::Lenient,
+            Some("chainable") => UndefinedBehavior::Chainable,
+            Some(other) => panic!("unknown undefined behavior '{}'", other),
+        });
+        env.set_keep_trailing_newline(settings.keep_trailing_newline);
+        env.set_trim_blocks(settings.trim_blocks);
+        env.set_lstrip_blocks(settings.lstrip_blocks);
+        env.set_syntax(settings.into_syntax());
 
         for (path, source) in &refs {
             let ref_filename = path.file_name().unwrap().to_str().unwrap();
@@ -122,8 +178,8 @@ fn test_vm_block_fragments() {
             let template = env.get_template(filename).unwrap();
 
             match template
-                .eval_to_state(&ctx)
-                .and_then(|mut x| x.render_block("fragment"))
+                .render_captured(Serde(&ctx))
+                .and_then(|mut x| x.with_state_mut(|state| state.render_block("fragment")))
             {
                 Ok(mut rendered) => {
                     rendered.push('\n');
@@ -173,6 +229,92 @@ fn test_custom_filter() {
 }
 
 #[test]
+fn test_dotted_integer_lookup() {
+    assert_eq!(render!("{{ [1, 2].0 }}"), "1");
+    assert_eq!(render!("{{ [1, 2].1 }}"), "2");
+}
+
+#[test]
+fn test_chained_comparisons() {
+    assert_eq!(
+        render!("{{ x not in y != z }}", x => "foo", y => "bar", z => "foo"),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ x not in y != y }}", x => "foo", y => "bar"),
+        "False"
+    );
+    assert_eq!(
+        render!("{{ lhs != rhs != lhs }}", lhs => 1, rhs => 2),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ needle in haystack in seq }}", needle => "o", haystack => "foo", seq => vec!["foo"]),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ needle in haystack == true }}", needle => "f", haystack => "foo"),
+        "False"
+    );
+
+    fn inc(state: &mut State) -> Value {
+        let old = state
+            .get_temp("chained_comparison_counter")
+            .unwrap_or_else(|| Value::from(0i64));
+        let new = Value::from(i64::try_from(old).unwrap() + 1);
+        state.set_temp("chained_comparison_counter", new.clone());
+        new
+    }
+
+    let mut env = Environment::new();
+    env.add_function("inc", inc);
+    assert_eq!(env.render_str("{{ 0 < inc() < 2 }}", ()).unwrap(), "True");
+    assert_eq!(
+        env.render_str("{{ 2 < inc() < fail() }}", ()).unwrap(),
+        "False"
+    );
+}
+
+#[test]
+fn test_dotted_integer_lookup_midchain() {
+    assert_eq!(
+        render!("{{ msgs.0.role }}", msgs => vec![context!(role => "user")]),
+        "user"
+    );
+    assert_eq!(
+        render!("{{ rows.10.name }}",
+                rows => (0..=10).map(|i| context!(name => format!("r{i}")))
+                                .collect::<Vec<_>>()),
+        "r10"
+    );
+    assert_eq!(
+        render!("{{ rows.1_000.name }}",
+                rows => vec![context!(name => "r1000"); 1001]),
+        "r1000"
+    );
+    assert_eq!(
+        render!("{{ data.0._meta }}", data => vec![context!(_meta => "x")]),
+        "x"
+    );
+
+    assert_eq!(render!("{{ 1.0 + 0 }}"), "1.0");
+    assert_eq!(render!("{{ 42. + 0 }}"), "42.0");
+    assert_eq!(render!("{{ 1.e5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.E5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.e+5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.E-3 }}"), "0.001");
+}
+
+#[test]
+#[cfg(feature = "unicode")]
+fn test_dotted_integer_lookup_midchain_unicode() {
+    assert_eq!(
+        render!("{{ data.0.α }}", data => vec![context!(α => "ok")]),
+        "ok"
+    );
+}
+
+#[test]
 fn test_items_and_dictsort_with_structs() {
     #[derive(Debug, Clone)]
     struct MyStruct;
@@ -193,11 +335,11 @@ fn test_items_and_dictsort_with_structs() {
 
     insta::assert_snapshot!(
         minijinja::render!("{{ x|items }}", x => Value::from_object(MyStruct)),
-        @r###"[["b", "B"], ["a", "A"]]"###
+        @"[('b', 'B'), ('a', 'A')]"
     );
     insta::assert_snapshot!(
         minijinja::render!("{{ x|dictsort }}", x => Value::from_object(MyStruct)),
-        @r###"[["a", "A"], ["b", "B"]]"###
+        @"[('a', 'A'), ('b', 'B')]"
     );
 }
 
@@ -341,7 +483,7 @@ fn test_flattening() {
     };
 
     let env = Environment::new();
-    env.render_str("{{ debug() }}", ctx).unwrap();
+    env.render_str("{{ debug() }}", Serde(ctx)).unwrap();
 }
 
 #[test]
@@ -351,7 +493,7 @@ fn test_flattening_sub_item_good() {
         more: Value::from(BTreeMap::from([("b", 23)])),
     };
 
-    let ctx = context!(bad, good => "good");
+    let ctx = context!(bad => Serde(bad), good => "good");
     let env = Environment::new();
 
     // we are not touching a bad value, so we are good
@@ -367,7 +509,7 @@ fn test_flattening_sub_item_bad_lookup() {
         more: Value::from(BTreeMap::from([("b", 23)])),
     };
 
-    let ctx = context!(bad, good => "good");
+    let ctx = context!(bad => Serde(bad), good => "good");
     let env = Environment::new();
 
     // resolving an invalid value will fail
@@ -381,7 +523,7 @@ fn test_flattening_sub_item_bad_attr() {
         more: Value::from(BTreeMap::from([("b", 23)])),
     };
 
-    let ctx = context!(good => context!(bad));
+    let ctx = context!(good => context!(bad => Serde(bad)));
     let env = Environment::new();
 
     // resolving an invalid value will fail, even in an attribute lookup
@@ -391,7 +533,7 @@ fn test_flattening_sub_item_bad_attr() {
     assert_eq!(err.kind(), ErrorKind::BadSerialization);
     assert_eq!(
         err.detail(),
-        Some("can only flatten structs and maps (got an enum)")
+        Some("can only flatten structs and maps (got a tuple struct)")
     );
 }
 
@@ -402,14 +544,14 @@ fn test_flattening_sub_item_shielded_print() {
         more: Value::from(BTreeMap::from([("b", 23)])),
     };
 
-    let ctx = context!(good => context!(bad));
+    let ctx = context!(good => context!(bad => Serde(bad)));
     let env = Environment::new();
 
     // this on the other hand is okay
     let value = env.render_str("{{ good }}", ctx).unwrap();
     assert_eq!(
         value,
-        r#"{"bad": <invalid value: could not serialize to value: can only flatten structs and maps (got an enum)>}"#
+        "{'bad': <invalid value: could not serialize to value: can only flatten structs and maps (got a tuple struct)>}"
     );
 }
 
@@ -438,19 +580,23 @@ fn test_undeclared_variables() {
     let mut env = Environment::new();
     env.add_template(
         "demo",
-        "{% set x = foo %}{{ x }}{{ bar.baz }}{{ bar.blub }}",
+        "{% set x = foo %}{{ x }}{{ bar.baz }}{{ bar.blub }}
+        {% macro blah() %}{{ macro_x }}{{ caller() }}{% endmacro %}",
     )
     .unwrap();
     let tmpl = env.get_template("demo").unwrap();
     let undeclared = tmpl.undeclared_variables(false);
     assert_eq!(
         undeclared,
-        ["foo", "bar"].into_iter().map(|x| x.to_string()).collect()
+        ["foo", "bar", "macro_x"]
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect()
     );
     let undeclared = tmpl.undeclared_variables(true);
     assert_eq!(
         undeclared,
-        ["foo", "bar.baz", "bar.blub"]
+        ["foo", "bar.baz", "bar.blub", "macro_x"]
             .into_iter()
             .map(|x| x.to_string())
             .collect()
@@ -483,6 +629,31 @@ fn test_undeclared_variables_bug() {
 }
 
 #[test]
+fn test_undeclared_variables_macro_bug() {
+    // https://github.com/mitsuhiko/minijinja/issues/712
+    let mut env = Environment::new();
+    env.add_template(
+        "demo",
+        r#"
+        {% macro bar(a) %}
+            {{ a }}
+        {% endmacro %}
+        {% call (b) bar() %}
+            {{ b }}
+        {% endcall %}
+        {{ a }} {{ b }}
+    "#,
+    )
+    .unwrap();
+    let tmpl = env.get_template("demo").unwrap();
+    let undeclared = tmpl.undeclared_variables(true);
+    assert_eq!(
+        undeclared,
+        ["a", "b"].into_iter().map(|x| x.to_string()).collect()
+    );
+}
+
+#[test]
 fn test_block_fragments() {
     let mut env = Environment::new();
     env.add_template(
@@ -493,7 +664,11 @@ fn test_block_fragments() {
     let tmpl = env.get_template("demo").unwrap();
 
     let rv_a = tmpl.render(()).unwrap();
-    let rv_b = tmpl.eval_to_state(()).unwrap().render_block("foo").unwrap();
+    let rv_b = tmpl
+        .render_captured(())
+        .unwrap()
+        .with_state_mut(|state| state.render_block("foo"))
+        .unwrap();
 
     assert_eq!(rv_a, "I am outside the fragmentfooSo am I!");
     assert_eq!(rv_b, "foo");
@@ -512,52 +687,99 @@ fn test_state() {
     )
     .unwrap();
     let template = env.get_template("foo.html").unwrap();
-    let mut state = template
-        .eval_to_state(context! {
+    let mut rendered = template
+        .render_captured(context! {
             variable => 23
         })
         .unwrap();
-    assert!(state.lookup("range").is_some());
-    assert!(!state.exports().contains(&"range"));
-    assert_eq!(state.lookup("global"), Some(Value::from(23 * 2)));
-    assert_eq!(state.call_macro("something", &[]).unwrap(), "46");
-    assert_eq!(state.render_block("baz").unwrap(), "[46]");
+    assert!(rendered.state().lookup("range").is_some());
+    assert!(!rendered.state().exports().contains(&"range"));
+    assert_eq!(rendered.state().lookup("global"), Some(Value::from(23 * 2)));
+    rendered.with_state_mut(|state| {
+        assert_eq!(state.call_macro("something", &[]).unwrap(), "46");
+        assert_eq!(state.render_block("baz").unwrap(), "[46]");
+    });
 }
 
 #[test]
-#[allow(unused_mut)]
-fn test_render_and_return_state() {
+fn test_loop_locals_do_not_persist_between_iterations() {
+    assert_eq!(
+        render!("{% for x in [1, 2] %}{% if loop.first %}{% set y = x %}{% endif %}[{{ y }}]{% endfor %}"),
+        "[1][]"
+    );
+}
+
+#[test]
+fn test_render_captured_state() {
+    #[allow(unused_mut)]
     let mut env = Environment::new();
     #[cfg(feature = "fuel")]
-    {
-        env.set_fuel(Some(100));
-    }
+    env.set_fuel(Some(100));
+
     let tmpl = env
         .template_from_str("{% for x in range(3) %}Hello {{ name }}!\n{% endfor %}{% set x = 1 %}")
         .unwrap();
-    let (rv, state) = tmpl
-        .render_and_return_state(context! { name => "Foo" })
-        .unwrap();
-    assert_eq!(rv, "Hello Foo!\nHello Foo!\nHello Foo!\n");
-    assert_eq!(state.lookup("x"), Some(Value::from(1)));
+    let captured = tmpl.render_captured(context! { name => "Foo" }).unwrap();
+    assert_eq!(captured.output(), "Hello Foo!\nHello Foo!\nHello Foo!\n");
+    assert_eq!(captured.state().lookup("x"), Some(Value::from(1)));
 
     #[cfg(feature = "fuel")]
-    {
-        assert_eq!(state.fuel_levels(), Some((26, 74)));
-    }
+    assert_eq!(captured.state().fuel_levels(), Some((26, 74)));
 }
 
 #[test]
-fn test_render_to_write_state() {
+fn test_render_captured() {
+    let env = Environment::new();
+    let mut rendered = env
+        .template_from_str("{% set foo = 42 %}{% macro bar() %}x{{ foo }}{% endmacro %}")
+        .unwrap()
+        .render_captured(())
+        .unwrap();
+    assert_eq!(rendered.output(), "");
+    assert_eq!(rendered.state().lookup("foo"), Some(Value::from(42)));
+    assert_eq!(
+        rendered
+            .with_state_mut(|state| state.call_macro("bar", &[]))
+            .ok()
+            .as_deref(),
+        Some("x42")
+    );
+}
+
+#[test]
+fn test_render_captured_to() {
     let env = Environment::new();
     let tmpl = env
         .template_from_str("{% set foo = 42 %}{% macro bar() %}x{% endmacro %}root")
         .unwrap();
     let mut out = Vec::<u8>::new();
-    let state = tmpl.render_to_write((), &mut out).unwrap();
+    let mut captured = tmpl.render_captured_to((), &mut out).unwrap();
     assert_eq!(String::from_utf8_lossy(&out), "root");
-    assert_eq!(state.lookup("foo"), Some(Value::from(42)));
-    assert_eq!(state.call_macro("bar", &[]).ok().as_deref(), Some("x"));
+    assert_eq!(captured.output(), "");
+    assert_eq!(captured.state().lookup("foo"), Some(Value::from(42)));
+    assert_eq!(
+        captured
+            .with_state_mut(|state| state.call_macro("bar", &[]))
+            .ok()
+            .as_deref(),
+        Some("x")
+    );
+}
+
+#[test]
+fn test_primitive_rendering() {
+    assert_eq!(
+        render!("{{ none }}|{{ true }}|{{ false }}"),
+        "None|True|False"
+    );
+    assert_eq!(render!("{{ [none, true, false] }}"), "[None, True, False]");
+
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+    assert_eq!(
+        render!(in env, "{{ none }}|{{ true }}|{{ false }}"),
+        "None|True|False"
+    );
 }
 
 #[test]
@@ -567,8 +789,12 @@ fn test_functions() {
         @"42"
     );
     assert_snapshot!(
+        render!("{{ {'f': f}.f() }}", f => Value::from_function(|| -> i32 { 42 })),
+        @"42"
+    );
+    assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Option<i32> { None })),
-        @"none"
+        @"None"
     );
     assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Result<i32, Error> { Ok(23) })),
@@ -600,7 +826,7 @@ fn test_invalid_value_iteration() {
         .template_from_str("{% for item in iter %}[{{ item }}]{% endfor %}")
         .unwrap();
     let err = t
-        .render_to_write(
+        .render_captured_to(
             context! { iter => Value::from_object(FailingIteration) },
             &mut out,
         )
@@ -656,5 +882,5 @@ fn test_test_caching() {
     )
     .unwrap();
     let rv = env.get_template("child.txt").unwrap().render(()).unwrap();
-    assert_eq!(rv, "false");
+    assert_eq!(rv, "False");
 }

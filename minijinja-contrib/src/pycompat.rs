@@ -1,4 +1,5 @@
-use minijinja::value::{from_args, ValueKind};
+use minijinja::formatting::{format, FormatStyle};
+use minijinja::value::{from_args, StringInput, Tuple, ValueKind};
 use minijinja::{Error, ErrorKind, State, Value};
 
 /// An unknown method callback implementing python methods on primitives.
@@ -25,6 +26,7 @@ use minijinja::{Error, ErrorKind, State, Value};
 /// * `str.count`
 /// * `str.endswith`
 /// * `str.find`
+/// * `str.format`
 /// * `str.isalnum`
 /// * `str.isalpha`
 /// * `str.isascii`
@@ -46,63 +48,67 @@ use minijinja::{Error, ErrorKind, State, Value};
 /// * `str.upper`
 #[cfg_attr(docsrs, doc(cfg(feature = "pycompat")))]
 pub fn unknown_method_callback(
-    _state: &State,
+    state: &mut State,
     value: &Value,
     method: &str,
     args: &[Value],
 ) -> Result<Value, Error> {
     match value.kind() {
-        ValueKind::String => string_methods(value, method, args),
+        ValueKind::String => string_methods(state, value, method, args),
         ValueKind::Map => map_methods(value, method, args),
         ValueKind::Seq => seq_methods(value, method, args),
         _ => Err(Error::from(ErrorKind::UnknownMethod)),
     }
 }
 
-fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Error> {
-    let s = match value.as_str() {
-        Some(s) => s,
-        None => return Err(Error::from(ErrorKind::UnknownMethod)),
+fn string_methods(
+    state: &State,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, Error> {
+    let Some(s) = value.as_str() else {
+        return Err(Error::from(ErrorKind::UnknownMethod));
     };
 
     match method {
         "upper" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.to_uppercase()))
         }
         "lower" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.to_lowercase()))
         }
         "islower" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_lowercase())))
         }
         "isupper" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_uppercase())))
         }
         "isspace" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_whitespace())))
         }
         "isdigit" | "isnumeric" => {
             // this is not a perfect mapping to what Python does, but
             // close enough for most uses in templates.
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_numeric())))
         }
         "isalnum" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_alphanumeric())))
         }
         "isalpha" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::from(s.chars().all(|x| x.is_alphabetic())))
         }
         "isascii" => {
-            from_args(args)?;
-            Ok(Value::from(s.chars().all(|x| x.is_ascii())))
+            let () = from_args(args)?;
+            Ok(Value::from(s.is_ascii()))
         }
         "strip" => {
             let (chars,): (Option<&str>,) = from_args(args)?;
@@ -138,7 +144,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
             }))
         }
         "title" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             // one shall not call into these filters.  However we consider ourselves
             // privileged.
             Ok(Value::from(minijinja::filters::title(s.into())))
@@ -147,7 +153,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
             let (sep, maxsplits) = from_args(args)?;
             // one shall not call into these filters.  However we consider ourselves
             // privileged.
-            Ok(minijinja::filters::split(s.into(), sep, maxsplits)
+            Ok(minijinja::filters::split(value, sep, maxsplits)?
                 .try_iter()?
                 .collect::<Value>())
         }
@@ -169,10 +175,12 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
             }
         }
         "capitalize" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             // one shall not call into these filters.  However we consider ourselves
             // privileged.
-            Ok(Value::from(minijinja::filters::capitalize(s.into())))
+            Ok(minijinja::filters::capitalize(StringInput::new(
+                state, value,
+            )?))
         }
         "count" => {
             let (what,): (&str,) = from_args(args)?;
@@ -191,6 +199,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
                 None => -1,
             }))
         }
+        "format" => format(FormatStyle::StrFormat, s, args).map(Value::from),
         "rfind" => {
             let (what,): (&str,) = from_args(args)?;
             Ok(Value::from(match s.rfind(what) {
@@ -264,7 +273,7 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
                 if idx > 0 {
                     rv.push_str(s);
                 }
-                write!(rv, "{}", value).ok();
+                write!(rv, "{value}").ok();
             }
             Ok(Value::from(rv))
         }
@@ -273,14 +282,13 @@ fn string_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, 
 }
 
 fn map_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Error> {
-    let obj = match value.as_object() {
-        Some(obj) => obj,
-        None => return Err(Error::from(ErrorKind::UnknownMethod)),
+    let Some(obj) = value.as_object() else {
+        return Err(Error::from(ErrorKind::UnknownMethod));
     };
 
     match method {
         "keys" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::make_object_iterable(obj.clone(), |obj| {
                 match obj.try_iter() {
                     Some(iter) => iter,
@@ -289,7 +297,7 @@ fn map_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Err
             }))
         }
         "values" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::make_object_iterable(obj.clone(), |obj| {
                 match obj.try_iter_pairs() {
                     Some(iter) => Box::new(iter.map(|(_, v)| v)),
@@ -298,19 +306,19 @@ fn map_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Err
             }))
         }
         "items" => {
-            from_args(args)?;
+            let () = from_args(args)?;
             Ok(Value::make_object_iterable(obj.clone(), |obj| {
                 match obj.try_iter_pairs() {
-                    Some(iter) => Box::new(iter.map(|(k, v)| Value::from(vec![k, v]))),
+                    Some(iter) => Box::new(iter.map(|(k, v)| Value::from(Tuple::from([k, v])))),
                     None => Box::new(None.into_iter()),
                 }
             }))
         }
         "get" => {
-            let (key,): (&Value,) = from_args(args)?;
+            let (key, default): (&Value, Option<Value>) = from_args(args)?;
             Ok(match obj.get_value(key) {
                 Some(value) => value,
-                None => Value::from(()),
+                None => default.unwrap_or_else(|| Value::from(())),
             })
         }
         _ => Err(Error::from(ErrorKind::UnknownMethod)),
@@ -318,9 +326,8 @@ fn map_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Err
 }
 
 fn seq_methods(value: &Value, method: &str, args: &[Value]) -> Result<Value, Error> {
-    let obj = match value.as_object() {
-        Some(obj) => obj,
-        None => return Err(Error::from(ErrorKind::UnknownMethod)),
+    let Some(obj) = value.as_object() else {
+        return Err(Error::from(ErrorKind::UnknownMethod));
     };
 
     match method {

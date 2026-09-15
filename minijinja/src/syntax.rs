@@ -180,6 +180,15 @@
 //! {{ title|upper if title }}
 //! ```
 //!
+//! Note that for compatibility with Jinja2, when the `else` block is missing the undefined
+//! value will be marked as "silent".  This means even if strict undefined behavior is
+//! requested, this undefined value will print to an empty string.  This means
+//! that this is always valid:
+//!
+//! ```jinja
+//! {{ value if false }} -> prints an empty string (silent undefined returned from else)
+//! ```
+//!
 //! # Tags
 //!
 //! Tags control logic in templates.  The following tags exist:
@@ -725,7 +734,7 @@
 //! ## `{% break %}` / `{% continue %}`
 //!
 //! If MiniJinja was compiled with the `loop_controls` feature, it’s possible to
-//! use `break`` and `continue`` in loops.  When break is reached, the loop is
+//! use `break` and `continue` in loops.  When break is reached, the loop is
 //! terminated; if continue is reached, the processing is stopped and continues
 //! with the next iteration.
 //!
@@ -745,6 +754,11 @@
 //! {%- if loop.index >= 10 %}{% break %}{% endif %}
 //! {%- endfor %}
 //! ```
+//!
+//! **Note on one-shot iterators:** if you break from a loop but you have
+//! accessed the `loop.nextitem` special variable, then you will lose one item.
+//! This is because accessing that attribute will peak into the iterator and
+//! there is no support for "putting values back".
 //!
 #![cfg_attr(
     feature = "custom_syntax",
@@ -923,7 +937,7 @@ mod imp {
     use crate::error::{Error, ErrorKind};
     use aho_corasick::{AhoCorasick, PatternID};
     use std::borrow::Cow;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     #[derive(Debug, PartialEq, Clone)]
     pub(crate) struct Delims {
@@ -947,6 +961,13 @@ mod imp {
         line_statement_prefix: Cow::Borrowed(""),
         line_comment_prefix: Cow::Borrowed(""),
     };
+
+    fn default_delims() -> Arc<Delims> {
+        static DEFAULT_DELIMS_ARC: OnceLock<Arc<Delims>> = OnceLock::new();
+        DEFAULT_DELIMS_ARC
+            .get_or_init(|| Arc::new(DEFAULT_DELIMS))
+            .clone()
+    }
 
     impl Delims {
         fn validated_start_delims(&self) -> Result<Vec<&str>, Error> {
@@ -1092,7 +1113,7 @@ mod imp {
     impl Default for SyntaxConfig {
         fn default() -> Self {
             Self {
-                delims: Arc::new(DEFAULT_DELIMS),
+                delims: default_delims(),
                 aho_corasick: None,
             }
         }
@@ -1103,7 +1124,7 @@ mod imp {
         #[cfg_attr(docsrs, doc(cfg(feature = "custom_syntax")))]
         pub fn builder() -> SyntaxConfigBuilder {
             SyntaxConfigBuilder {
-                delims: Arc::new(DEFAULT_DELIMS),
+                delims: default_delims(),
             }
         }
 

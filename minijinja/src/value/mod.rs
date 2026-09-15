@@ -6,8 +6,8 @@
 //! For the most part the existence of the value type can be ignored as
 //! MiniJinja will perform the necessary conversions for you.  For instance
 //! if you write a filter that converts a string you can directly declare the
-//! filter to take a [`String`].  However for some more advanced use cases it's
-//! useful to know that this type exists.
+//! filter to take a [`String`].  However for some more advanced use cases
+//! it's useful to know that this type exists.
 //!
 //! # Basic Value Conversions
 //!
@@ -27,8 +27,8 @@
 //! });
 //! ```
 //!
-//! Or via the [`FromIterator`] trait which can create sequences or maps.  When
-//! given a tuple it creates maps, otherwise it makes a sequence.
+//! Or via the [`FromIterator`] trait, which creates sequences.  Maps can be
+//! created from pairs with [`Value::from_pairs`].
 //!
 //! ```
 //! # use minijinja::value::Value;
@@ -36,7 +36,7 @@
 //! let value: Value = (1..10).into_iter().collect();
 //!
 //! // collection into a map
-//! let value: Value = [("key", "value")].into_iter().collect();
+//! let value = Value::from_pairs([("key", "value")]);
 //! ```
 //!
 //! For certain types of iterators (`Send` + `Sync` + `'static`) it's also
@@ -84,18 +84,24 @@
 //!
 //! # Serde Conversions
 //!
-//! MiniJinja will usually however create values via an indirection via [`serde`] when
-//! a template is rendered or an expression is evaluated.  This can also be
-//! triggered manually by using the [`Value::from_serialize`] method:
+//! Serde conversion is available explicitly through the `Serde` wrapper when
+//! the `serde` feature is enabled.
 //!
-//! ```
-//! # use minijinja::value::Value;
-//! let value = Value::from_serialize(&[1, 2, 3]);
-//! ```
+#![cfg_attr(
+    feature = "serde",
+    doc = r"
+```
+# use minijinja::value::{Serde, Value};
+let value = Value::from(Serde(&[1, 2, 3]));
+```
+"
+)]
+//! Rendering APIs primarily accept `Into<Value>`. Wrap custom Serde contexts in
+//! `Serde` when passing them to those APIs.
 //!
-//! The inverse of that operation is to pass a value directly as serializer to
-//! a type that supports deserialization.  This requires the `deserialization`
-//! feature.
+//! The inverse of the serialize operation is to pass a value directly as
+//! serializer to a type that supports deserialization.  This requires the
+//! `deserialization` feature.
 //!
 #![cfg_attr(
     feature = "deserialization",
@@ -169,37 +175,82 @@ let vec = Vec::<i32>::deserialize(value).unwrap();
 //!
 //! Invalid values are typically encountered in the following situations:
 //!
-//! - serialization fails with an error: this is the case when a value is crated
-//!   via [`Value::from_serialize`] and the underlying [`Serialize`] implementation
-//!   fails with an error.
+//! - serialization fails with an error: this is the case when a value is created
+//!   through `Serde` and the underlying `serde::Serialize` implementation fails
+//!   with an error.
 //! - fallible iteration: there might be situations where an iterator cannot indicate
 //!   failure ahead of iteration and must abort.  In that case the only option an
 //!   iterator in MiniJinja has is to create an invalid value.
 //!
 //! It's generally recommende to ignore the existence of invalid objects and let them
 //! fail naturally as they are encountered.
+//!
+//! # Notes on Bytes and Strings
+//!
+//! Usually one would pass strings to templates as Jinja is entirely based on string
+//! rendering.  However there are situations where it can be useful to pass bytes instead.
+//! As such MiniJinja allows a value type to carry bytes even though there is no syntax
+//! within the template language to create a byte literal.
+//!
+//! When rendering bytes as strings, MiniJinja will attempt to interpret them as
+//! lossy utf-8.  This is a bit different to Jinja2 which in Python 3 stopped
+//! rendering byte strings as strings.  This is an intentional change that was
+//! deemed acceptable given how infrequently bytes are used but how relatively
+//! commonly bytes are often holding "almost utf-8" in templates.  Most
+//! conversions to strings also will do almost the same.  The debug rendering of
+//! bytes however is different and bytes are not iterable.  Like strings however
+//! they can be sliced and indexed, but they will be sliced by bytes and not by
+//! characters.
 
 // this module is based on the content module in insta which in turn is based
 // on the content module in serde::private::ser.
 
+use core::str;
+#[cfg(feature = "serde")]
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+#[cfg(feature = "serde")]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-use serde::ser::{Serialize, Serializer};
+#[cfg(feature = "serde")]
+use serde::ser::SerializeTupleStruct;
 
 use crate::error::{Error, ErrorKind};
 use crate::functions;
-use crate::utils::OnDrop;
 use crate::value::ops::as_f64;
-use crate::value::serialize::transform;
 use crate::vm::State;
 
-pub use crate::value::argtypes::{from_args, ArgType, FunctionArgs, FunctionResult, Kwargs, Rest};
+pub use crate::value::argtypes::{
+    from_args, ArgType, FunctionArgs, FunctionResult, Kwargs, Rest, StringInput, ValueOrKwargs,
+};
+pub use crate::value::merge_object::merge_maps;
 pub use crate::value::object::{DynObject, Enumerator, Object, ObjectExt, ObjectRepr};
+
+#[derive(Debug)]
+pub(crate) struct StaticKeyMap(pub(crate) Vec<(&'static str, Value)>);
+
+impl Object for StaticKeyMap {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.get_value_by_str(key.as_str()?)
+    }
+
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.0
+            .iter()
+            .find_map(|(map_key, value)| (*map_key == key).then(|| value.clone()))
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Values(self.0.iter().map(|(key, _)| Value::from(*key)).collect())
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.0.len())
+    }
+}
 
 #[macro_use]
 mod type_erase;
@@ -210,15 +261,68 @@ pub(crate) mod merge_object;
 pub(crate) mod namespace_object;
 mod object;
 pub(crate) mod ops;
-mod serialize;
-#[cfg(feature = "key_interning")]
-mod string_interning;
 
-#[cfg(feature = "deserialization")]
-pub use self::deserialize::ViaDeserialize;
+mod serialize;
+mod tuple;
+
+pub use self::tuple::Tuple;
+
+/// Converts between a Rust type and a template value through Serde.
+///
+/// This wrapper lets [`Value::from`] and APIs accepting `Into<Value>` use
+/// Serde without making serialization the default conversion mechanism.  It
+/// can also be used as a function argument to deserialize a [`Value`] into a
+/// Rust type when the `deserialization` feature is enabled.
+///
+/// ```
+/// use minijinja::value::{Serde, Value};
+///
+/// let value = Value::from(Serde(&[1, 2, 3]));
+/// ```
+#[cfg_attr(
+    feature = "deserialization",
+    doc = r#"
+As a function argument, `Serde<T>` deserializes a template value into `T`:
+
+```rust
+# use minijinja::Environment;
+# use serde::Deserialize;
+# let mut env = Environment::new();
+use minijinja::value::Serde;
+use std::path::PathBuf;
+
+fn dirname(path: Serde<PathBuf>) -> String {
+    path.display().to_string()
+}
+
+# env.add_filter("dirname", dirname);
+```
+"#
+)]
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+#[derive(Clone, Copy, Debug)]
+pub struct Serde<T>(pub T);
+
+#[cfg(feature = "serde")]
+impl<T> std::ops::Deref for Serde<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T> std::ops::DerefMut for Serde<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
 
 // We use in-band signalling to roundtrip some internal values.  This is
 // not ideal but unfortunately there is no better system in serde today.
+#[cfg(feature = "serde")]
 const VALUE_HANDLE_MARKER: &str = "\x01__minijinja_ValueHandle";
 
 #[cfg(feature = "preserve_order")]
@@ -240,62 +344,89 @@ pub(crate) fn value_map_with_capacity(capacity: usize) -> ValueMap {
     }
 }
 
+#[cfg(feature = "serde")]
+pub(crate) struct ValueHandleRegistry {
+    single: Option<(u32, Value)>,
+    overflow: BTreeMap<u32, Value>,
+}
+
+#[cfg(feature = "serde")]
+impl ValueHandleRegistry {
+    const fn new() -> Self {
+        Self {
+            single: None,
+            overflow: BTreeMap::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert(&mut self, handle: u32, value: Value) {
+        if self.single.is_none() && self.overflow.is_empty() {
+            self.single = Some((handle, value));
+            return;
+        }
+
+        if let Some((other_handle, other_value)) = self.single.take() {
+            self.overflow.insert(other_handle, other_value);
+        }
+        self.overflow.insert(handle, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn remove(&mut self, handle: u32) -> Option<Value> {
+        if let Some((single_handle, _)) = self.single {
+            if single_handle == handle {
+                return self.single.take().map(|(_, value)| value);
+            }
+        }
+        self.overflow.remove(&handle)
+    }
+}
+
+#[cfg(feature = "serde")]
 thread_local! {
     static INTERNAL_SERIALIZATION: Cell<bool> = const { Cell::new(false) };
 
     // This should be an AtomicU64 but sadly 32bit targets do not necessarily have
     // AtomicU64 available.
     static LAST_VALUE_HANDLE: Cell<u32> = const { Cell::new(0) };
-    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = RefCell::new(BTreeMap::new());
+    static VALUE_HANDLES: RefCell<ValueHandleRegistry> = const { RefCell::new(ValueHandleRegistry::new()) };
 }
 
 /// Function that returns true when serialization for [`Value`] is taking place.
 ///
-/// MiniJinja internally creates [`Value`] objects from all values passed to the
-/// engine.  It does this by going through the regular serde serialization trait.
-/// In some cases users might want to customize the serialization specifically for
-/// MiniJinja because they want to tune the object for the template engine
-/// independently of what is normally serialized to disk.
+/// When a value is converted through the `Serde` wrapper, MiniJinja uses the
+/// regular Serde serialization trait. In some cases users might want to customize
+/// that serialization for the template engine independently of what is normally
+/// serialized to disk.
 ///
 /// This function returns `true` when MiniJinja is serializing to [`Value`] and
-/// `false` otherwise.  You can call this within your own [`Serialize`]
+/// `false` otherwise. You can call this within your own `serde::Serialize`
 /// implementation to change the output format.
 ///
 /// This is particularly useful as serialization for MiniJinja does not need to
 /// support deserialization.  So it becomes possible to completely change what
 /// gets sent there, even at the cost of serializing something that cannot be
 /// deserialized.
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub fn serializing_for_value() -> bool {
     INTERNAL_SERIALIZATION.with(|flag| flag.get())
 }
 
-/// Enables value optimizations.
-///
-/// If `key_interning` is enabled, this turns on that feature, otherwise
-/// it becomes a noop.
-#[inline(always)]
-pub(crate) fn value_optimization() -> impl Drop {
-    #[cfg(feature = "key_interning")]
-    {
-        crate::value::string_interning::use_string_cache()
-    }
-    #[cfg(not(feature = "key_interning"))]
-    {
-        OnDrop::new(|| {})
-    }
+#[cfg(feature = "serde")]
+struct InternalSerializationGuard<'a> {
+    flag: &'a Cell<bool>,
+    reset_on_drop: bool,
 }
 
-fn mark_internal_serialization() -> impl Drop {
-    let old = INTERNAL_SERIALIZATION.with(|flag| {
-        let old = flag.get();
-        flag.set(true);
-        old
-    });
-    OnDrop::new(move || {
-        if !old {
-            INTERNAL_SERIALIZATION.with(|flag| flag.set(false));
+#[cfg(feature = "serde")]
+impl Drop for InternalSerializationGuard<'_> {
+    fn drop(&mut self) {
+        if self.reset_on_drop {
+            self.flag.set(false);
         }
-    })
+    }
 }
 
 /// Describes the kind of value.
@@ -356,11 +487,19 @@ pub(crate) enum StringType {
     Safe,
 }
 
+/// Type type of undefined
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum UndefinedType {
+    Default,
+    Silent,
+}
+
 /// Wraps an internal copyable value but marks it as packed.
 ///
 /// This is used for `i128`/`u128` in the value repr to avoid
 /// the excessive 16 byte alignment.
-#[derive(Copy)]
+#[derive(Copy, Debug)]
+#[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 #[repr(packed)]
 pub(crate) struct Packed<T: Copy>(pub T);
 
@@ -372,7 +511,7 @@ impl<T: Copy> Clone for Packed<T> {
 
 /// Max size of a small str.
 ///
-/// Logic: Value is 24 bytes. 1 byte is for the disciminant. One byte is
+/// Logic: Value is 24 bytes. 1 byte is for the discriminant. One byte is
 /// needed for the small str length.
 const SMALL_STR_CAP: usize = 22;
 
@@ -410,12 +549,12 @@ impl SmallStr {
 
 #[derive(Clone)]
 pub(crate) enum ValueRepr {
-    Undefined,
+    None,
+    Undefined(UndefinedType),
     Bool(bool),
     U64(u64),
     I64(i64),
     F64(f64),
-    None,
     Invalid(Arc<Error>),
     U128(Packed<u128>),
     I128(Packed<i128>),
@@ -425,36 +564,90 @@ pub(crate) enum ValueRepr {
     Object(DynObject),
 }
 
+fn python_string_debug_fmt(value: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let quote = if value.contains('\'') && !value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let quote_str = if quote == '\'' { "'" } else { "\"" };
+
+    f.write_str(quote_str)?;
+    let mut last = 0;
+    for (idx, ch) in value.char_indices() {
+        let escaped = match ch {
+            '\'' if quote == '\'' => Some("\\'"),
+            '"' if quote == '"' => Some("\\\""),
+            '\\' => Some("\\\\"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            f.write_str(&value[last..idx])?;
+            f.write_str(escaped)?;
+            last = idx + ch.len_utf8();
+        } else if ch.is_control() {
+            f.write_str(&value[last..idx])?;
+            let codepoint = ch as u32;
+            if codepoint <= 0xff {
+                write!(f, "\\x{codepoint:02x}")?;
+            } else if codepoint <= 0xffff {
+                write!(f, "\\u{codepoint:04x}")?;
+            } else {
+                write!(f, "\\U{codepoint:08x}")?;
+            }
+            last = idx + ch.len_utf8();
+        }
+    }
+    f.write_str(&value[last..])?;
+    f.write_str(quote_str)
+}
+
 impl fmt::Debug for ValueRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ValueRepr::Undefined => f.write_str("undefined"),
-            ValueRepr::Bool(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::U64(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::I64(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::F64(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::None => f.write_str("none"),
-            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
+        match *self {
+            ValueRepr::Undefined(_) => f.write_str("undefined"),
+            ValueRepr::Bool(val) => f.write_str(if val { "True" } else { "False" }),
+            ValueRepr::U64(ref val) => fmt::Debug::fmt(val, f),
+            ValueRepr::I64(ref val) => fmt::Debug::fmt(val, f),
+            ValueRepr::F64(ref val) => fmt::Debug::fmt(val, f),
+            ValueRepr::None => f.write_str("None"),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::U128(val) => fmt::Debug::fmt(&{ val.0 }, f),
             ValueRepr::I128(val) => fmt::Debug::fmt(&{ val.0 }, f),
-            ValueRepr::String(val, _) => fmt::Debug::fmt(val, f),
-            ValueRepr::SmallStr(val) => fmt::Debug::fmt(val.as_str(), f),
-            ValueRepr::Bytes(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::Object(val) => val.render(f),
+            ValueRepr::String(ref val, _) => python_string_debug_fmt(val, f),
+            ValueRepr::SmallStr(ref val) => python_string_debug_fmt(val.as_str(), f),
+            ValueRepr::Bytes(ref val) => {
+                write!(f, "b'")?;
+                for &b in val.iter() {
+                    if b == b'"' {
+                        write!(f, "\"")?
+                    } else {
+                        write!(f, "{}", b.escape_ascii())?;
+                    }
+                }
+                write!(f, "'")
+            }
+            ValueRepr::Object(ref val) => val.render(f),
         }
     }
 }
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match &self.0 {
-            ValueRepr::None | ValueRepr::Undefined => 0u8.hash(state),
+        match self.0 {
+            ValueRepr::None | ValueRepr::Undefined(_) => 0u8.hash(state),
             ValueRepr::String(ref s, _) => s.hash(state),
-            ValueRepr::SmallStr(s) => s.as_str().hash(state),
+            ValueRepr::SmallStr(ref s) => s.as_str().hash(state),
             ValueRepr::Bool(b) => b.hash(state),
             ValueRepr::Invalid(ref e) => (e.kind(), e.detail()).hash(state),
-            ValueRepr::Bytes(b) => b.hash(state),
-            ValueRepr::Object(d) => d.hash(state),
+            ValueRepr::Bytes(ref b) => b.hash(state),
+            ValueRepr::Object(ref d) => {
+                self.is_tuple().hash(state);
+                d.hash(state);
+            }
             ValueRepr::U64(_)
             | ValueRepr::I64(_)
             | ValueRepr::F64(_)
@@ -463,7 +656,7 @@ impl Hash for Value {
                 if let Ok(val) = i64::try_from(self.clone()) {
                     val.hash(state)
                 } else {
-                    as_f64(self).map(|x| x.to_bits()).hash(state)
+                    as_f64(self, true).map(|x| x.to_bits()).hash(state)
                 }
             }
         }
@@ -477,28 +670,57 @@ pub struct Value(pub(crate) ValueRepr);
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (ValueRepr::None, ValueRepr::None) => true,
-            (ValueRepr::Undefined, ValueRepr::Undefined) => true,
-            (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a == b,
-            (ValueRepr::SmallStr(a), ValueRepr::SmallStr(b)) => a.as_str() == b.as_str(),
-            (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a == b,
-            _ => match ops::coerce(self, other) {
+            (&ValueRepr::None, &ValueRepr::None) => true,
+            (&ValueRepr::Undefined(_), &ValueRepr::Undefined(_)) => true,
+            (&ValueRepr::String(ref a, _), &ValueRepr::String(ref b, _)) => a == b,
+            (&ValueRepr::SmallStr(ref a), &ValueRepr::SmallStr(ref b)) => a.as_str() == b.as_str(),
+            (&ValueRepr::Bytes(ref a), &ValueRepr::Bytes(ref b)) => a == b,
+            _ => match ops::coerce(self, other, false) {
                 Some(ops::CoerceResult::F64(a, b)) => a == b,
                 Some(ops::CoerceResult::I128(a, b)) => a == b,
                 Some(ops::CoerceResult::Str(a, b)) => a == b,
                 None => {
                     if let (Some(a), Some(b)) = (self.as_object(), other.as_object()) {
+                        if self.is_tuple() != other.is_tuple() {
+                            return false;
+                        }
                         if a.is_same_object(b) {
                             return true;
+                        } else if a.is_same_object_type(b) {
+                            if let Some(rv) = a.custom_cmp(b) {
+                                return rv == Ordering::Equal;
+                            }
                         }
                         match (a.repr(), b.repr()) {
                             (ObjectRepr::Map, ObjectRepr::Map) => {
-                                if a.enumerator_len() != b.enumerator_len() {
+                                // only if we have known lengths can we compare the enumerators
+                                // ahead of time.  This function has a fallback for when a
+                                // map has an unknown length.  That's generally a bad idea, but
+                                // it makes sense supporting regardless as silent failures are
+                                // not a lot of fun.
+                                let mut need_length_fallback = true;
+                                if let (Some(a_len), Some(b_len)) =
+                                    (a.enumerator_len(), b.enumerator_len())
+                                {
+                                    if a_len != b_len {
+                                        return false;
+                                    }
+                                    need_length_fallback = false;
+                                }
+                                let mut a_count = 0;
+                                if !a.try_iter_pairs().is_some_and(|mut ak| {
+                                    ak.all(|(k, v1)| {
+                                        a_count += 1;
+                                        b.get_value(&k) == Some(v1)
+                                    })
+                                }) {
                                     return false;
                                 }
-                                a.try_iter_pairs().map_or(false, |mut ak| {
-                                    ak.all(|(k, v1)| b.get_value(&k).map_or(false, |v2| v1 == v2))
-                                })
+                                if !need_length_fallback {
+                                    true
+                                } else {
+                                    a_count == b.try_iter().map_or(0, |x| x.count())
+                                }
                             }
                             (
                                 ObjectRepr::Seq | ObjectRepr::Iterable,
@@ -510,7 +732,12 @@ impl PartialEq for Value {
                                     false
                                 }
                             }
-                            _ => false,
+                            // terrible fallback for plain objects
+                            (ObjectRepr::Plain, ObjectRepr::Plain) => {
+                                a.to_string() == b.to_string()
+                            }
+                            // should not happen
+                            (_, _) => false,
                         }
                     } else {
                         false
@@ -538,46 +765,162 @@ fn f64_total_cmp(left: f64, right: f64) -> Ordering {
     left.cmp(&right)
 }
 
+fn cmp_f64(left: f64, right: f64) -> Ordering {
+    if left == right {
+        Ordering::Equal
+    } else {
+        f64_total_cmp(left, right)
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Number {
+    I128(i128),
+    U128(u128),
+    F64(f64),
+}
+
+fn number(value: &Value) -> Option<Number> {
+    Some(match &value.0 {
+        ValueRepr::U64(x) => Number::U128(*x as u128),
+        ValueRepr::U128(x) => Number::U128(x.0),
+        ValueRepr::I64(x) => Number::I128(*x as i128),
+        ValueRepr::I128(x) => Number::I128(x.0),
+        ValueRepr::F64(x) => Number::F64(*x),
+        _ => return None,
+    })
+}
+
+fn cmp_i128_u128(left: i128, right: u128) -> Ordering {
+    if left < 0 {
+        Ordering::Less
+    } else {
+        (left as u128).cmp(&right)
+    }
+}
+
+fn cmp_f64_i128(left: f64, right: i128) -> Ordering {
+    match cmp_f64(left, right as f64) {
+        Ordering::Equal if left.is_finite() => {
+            if left >= i128::MAX as f64 {
+                Ordering::Greater
+            } else {
+                let trunc = left.trunc();
+                (trunc as i128)
+                    .cmp(&right)
+                    .then_with(|| left.partial_cmp(&trunc).unwrap())
+            }
+        }
+        rv => rv,
+    }
+}
+
+fn cmp_f64_u128(left: f64, right: u128) -> Ordering {
+    match cmp_f64(left, right as f64) {
+        Ordering::Equal if left.is_finite() => {
+            if left < 0.0 {
+                Ordering::Less
+            } else if left >= u128::MAX as f64 {
+                Ordering::Greater
+            } else {
+                (left as u128).cmp(&right)
+            }
+        }
+        rv => rv,
+    }
+}
+
+// This is only needed when `coerce` cannot find a common lossless numeric
+// representation.  Keep it out of line so the rare fallback does not bloat the
+// hot comparison path.
+#[cold]
+#[inline(never)]
+fn cmp_uncoercible_numbers(left: &Value, right: &Value) -> Ordering {
+    match (number(left).unwrap(), number(right).unwrap()) {
+        (Number::F64(a), Number::F64(b)) => cmp_f64(a, b),
+        (Number::F64(a), Number::I128(b)) => cmp_f64_i128(a, b),
+        (Number::I128(a), Number::F64(b)) => cmp_f64_i128(b, a).reverse(),
+        (Number::F64(a), Number::U128(b)) => cmp_f64_u128(a, b),
+        (Number::U128(a), Number::F64(b)) => cmp_f64_u128(b, a).reverse(),
+        (Number::I128(a), Number::I128(b)) => a.cmp(&b),
+        (Number::U128(a), Number::U128(b)) => a.cmp(&b),
+        (Number::I128(a), Number::U128(b)) => cmp_i128_u128(a, b),
+        (Number::U128(a), Number::I128(b)) => cmp_i128_u128(b, a).reverse(),
+    }
+}
+
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
-        let value_ordering = match (&self.0, &other.0) {
-            (ValueRepr::None, ValueRepr::None) => Ordering::Equal,
-            (ValueRepr::Undefined, ValueRepr::Undefined) => Ordering::Equal,
-            (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a.cmp(b),
-            (ValueRepr::SmallStr(a), ValueRepr::SmallStr(b)) => a.as_str().cmp(b.as_str()),
-            (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a.cmp(b),
-            _ => match ops::coerce(self, other) {
-                Some(ops::CoerceResult::F64(a, b)) => f64_total_cmp(a, b),
+        let kind_ordering = self.kind().cmp(&other.kind());
+        if matches!(kind_ordering, Ordering::Less | Ordering::Greater) {
+            return kind_ordering;
+        }
+        match (&self.0, &other.0) {
+            (&ValueRepr::None, &ValueRepr::None) => Ordering::Equal,
+            (&ValueRepr::Undefined(_), &ValueRepr::Undefined(_)) => Ordering::Equal,
+            (&ValueRepr::String(ref a, _), &ValueRepr::String(ref b, _)) => a.cmp(b),
+            (&ValueRepr::SmallStr(ref a), &ValueRepr::SmallStr(ref b)) => {
+                a.as_str().cmp(b.as_str())
+            }
+            (&ValueRepr::Bytes(ref a), &ValueRepr::Bytes(ref b)) => a.cmp(b),
+            // `coerce` represents two u128 values as i128, which reverses the
+            // order if only one of them exceeds i128::MAX.
+            (&ValueRepr::U128(a), &ValueRepr::U128(b)) => { a.0 }.cmp(&{ b.0 }),
+            _ => match ops::coerce(self, other, false) {
+                Some(ops::CoerceResult::F64(a, b)) => cmp_f64(a, b),
                 Some(ops::CoerceResult::I128(a, b)) => a.cmp(&b),
                 Some(ops::CoerceResult::Str(a, b)) => a.cmp(b),
-                None => match (self.kind(), other.kind()) {
-                    (ValueKind::Seq, ValueKind::Seq) => match (self.try_iter(), other.try_iter()) {
-                        (Ok(a), Ok(b)) => a.cmp(b),
-                        _ => self.len().cmp(&other.len()),
-                    },
-                    (ValueKind::Map, ValueKind::Map) => {
-                        if let (Some(a), Some(b)) = (self.as_object(), other.as_object()) {
-                            if a.is_same_object(b) {
-                                Ordering::Equal
-                            } else {
+                None => {
+                    if self.is_number() && other.is_number() {
+                        return cmp_uncoercible_numbers(self, other);
+                    }
+
+                    let a = self.as_object().unwrap();
+                    let b = other.as_object().unwrap();
+
+                    match self.is_tuple().cmp(&other.is_tuple()) {
+                        Ordering::Equal => {}
+                        rv => return rv,
+                    }
+
+                    if a.is_same_object(b) {
+                        Ordering::Equal
+                    } else {
+                        // if there is a custom comparison, run it.
+                        if a.is_same_object_type(b) {
+                            if let Some(rv) = a.custom_cmp(b) {
+                                return rv;
+                            }
+                        }
+                        match (a.repr(), b.repr()) {
+                            (ObjectRepr::Map, ObjectRepr::Map) => {
                                 // This is not really correct.  Because the keys can be in arbitrary
                                 // order this could just sort really weirdly as a result.  However
                                 // we don't want to pay the cost of actually sorting the keys for
                                 // ordering so we just accept this for now.
                                 match (a.try_iter_pairs(), b.try_iter_pairs()) {
                                     (Some(a), Some(b)) => a.cmp(b),
-                                    _ => self.len().cmp(&other.len()),
+                                    _ => unreachable!(),
                                 }
                             }
-                        } else {
-                            unreachable!();
+                            (
+                                ObjectRepr::Seq | ObjectRepr::Iterable,
+                                ObjectRepr::Seq | ObjectRepr::Iterable,
+                            ) => match (a.try_iter(), b.try_iter()) {
+                                (Some(a), Some(b)) => a.cmp(b),
+                                _ => unreachable!(),
+                            },
+                            // terrible fallback for plain objects
+                            (ObjectRepr::Plain, ObjectRepr::Plain) => {
+                                a.to_string().cmp(&b.to_string())
+                            }
+                            // should not happen
+                            (_, _) => unreachable!(),
                         }
                     }
-                    _ => Ordering::Equal,
-                },
+                }
             },
-        };
-        value_ordering.then((self.kind() as usize).cmp(&(other.kind() as usize)))
+        }
     }
 }
 
@@ -589,9 +932,9 @@ impl fmt::Debug for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            ValueRepr::Undefined => Ok(()),
-            ValueRepr::Bool(val) => val.fmt(f),
+        match self.0 {
+            ValueRepr::Undefined(_) => Ok(()),
+            ValueRepr::Bool(val) => f.write_str(if val { "True" } else { "False" }),
             ValueRepr::U64(val) => val.fmt(f),
             ValueRepr::I64(val) => val.fmt(f),
             ValueRepr::F64(val) => {
@@ -607,39 +950,21 @@ impl fmt::Display for Value {
                     write!(f, "{num}")
                 }
             }
-            ValueRepr::None => f.write_str("none"),
-            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
+            ValueRepr::None => f.write_str("None"),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::I128(val) => write!(f, "{}", { val.0 }),
-            ValueRepr::String(val, _) => write!(f, "{val}"),
-            ValueRepr::SmallStr(val) => write!(f, "{}", val.as_str()),
-            ValueRepr::Bytes(val) => write!(f, "{}", String::from_utf8_lossy(val)),
+            ValueRepr::String(ref val, _) => write!(f, "{val}"),
+            ValueRepr::SmallStr(ref val) => write!(f, "{}", val.as_str()),
+            ValueRepr::Bytes(ref val) => write!(f, "{}", String::from_utf8_lossy(val)),
             ValueRepr::U128(val) => write!(f, "{}", { val.0 }),
-            ValueRepr::Object(x) => write!(f, "{x}"),
+            ValueRepr::Object(ref x) => write!(f, "{x}"),
         }
     }
 }
 
 impl Default for Value {
     fn default() -> Value {
-        ValueRepr::Undefined.into()
-    }
-}
-
-/// Intern a string.
-///
-/// When the `key_interning` feature is in used, then MiniJinja will attempt to
-/// reuse strings in certain cases.  This function can be used to utilize the
-/// same functionality.  There is no guarantee that a string will be interned
-/// as there are heuristics involved for it.  Additionally the string interning
-/// will only work during the template engine execution (eg: within filters etc.).
-pub fn intern(s: &str) -> Arc<str> {
-    #[cfg(feature = "key_interning")]
-    {
-        crate::value::string_interning::try_intern(s)
-    }
-    #[cfg(not(feature = "key_interning"))]
-    {
-        Arc::from(s.to_string())
+        ValueRepr::Undefined(UndefinedType::Default).into()
     }
 }
 
@@ -649,46 +974,29 @@ impl Value {
     ///
     /// This constant exists because the undefined type does not exist in Rust
     /// and this is the only way to construct it.
-    pub const UNDEFINED: Value = Value(ValueRepr::Undefined);
+    pub const UNDEFINED: Value = Value(ValueRepr::Undefined(UndefinedType::Default));
 
-    /// Creates a value from something that can be serialized.
+    /// Creates a map value from an iterator of key-value pairs.
     ///
-    /// This is the method that MiniJinja will generally use whenever a serializable
-    /// object is passed to one of the APIs that internally want to create a value.
-    /// For instance this is what [`context!`](crate::context) and
-    /// [`render`](crate::Template::render) will use.
-    ///
-    /// During serialization of the value, [`serializing_for_value`] will return
-    /// `true` which makes it possible to customize serialization for MiniJinja.
-    /// For more information see [`serializing_for_value`].
-    ///
-    /// ```
-    /// # use minijinja::value::Value;
-    /// let val = Value::from_serialize(&vec![1, 2, 3]);
-    /// ```
-    ///
-    /// This method does not fail but it might return a value that is not valid.  Such
-    /// values will when operated on fail in the template engine in most situations.
-    /// This for instance can happen if the underlying implementation of [`Serialize`]
-    /// fails.  There are also cases where invalid objects are silently hidden in the
-    /// engine today.  This is for instance the case for when keys are used in hash maps
-    /// that the engine cannot deal with.  Invalid values are considered an implementation
-    /// detail.  There is currently no API to validate a value.
-    ///
-    /// If the `deserialization` feature is enabled then the inverse of this method
-    /// is to use the [`Value`] type as serializer.  You can pass a value into the
-    /// [`deserialize`](serde::Deserialize::deserialize) method of a type that supports
-    /// serde deserialization.
-    pub fn from_serialize<T: Serialize>(value: T) -> Value {
-        let _serialization_guard = mark_internal_serialization();
-        let _optimization_guard = value_optimization();
-        transform(value)
+    /// Unlike collecting directly into a [`Value`], which creates a sequence,
+    /// this method interprets two-item tuples as map entries.
+    pub fn from_pairs<I, K, V>(iter: I) -> Value
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<Value>,
+        V: Into<Value>,
+    {
+        Value::from_object(
+            iter.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect::<ValueMap>(),
+        )
     }
 
     /// Extracts a contained error.
     ///
     /// An invalid value carres an error internally and will reveal that error
-    /// at a later point when iteracted with.  This is used to carry
+    /// at a later point when interacted with.  This is used to carry
     /// serialization errors or failures that happen when the engine otherwise
     /// assumes an infallible operation such as iteration.
     pub(crate) fn validate(self) -> Result<Value, Error> {
@@ -713,6 +1021,20 @@ impl Value {
     /// ```
     pub fn from_safe_string(value: String) -> Value {
         ValueRepr::String(Arc::from(value), StringType::Safe).into()
+    }
+
+    /// Creates a value from a byte vector.
+    ///
+    /// MiniJinja can hold on to bytes and has some limited built-in support for
+    /// working with them.  They are non iterable and not particularly useful
+    /// in the context of templates.  When they are stringified, they are assumed
+    /// to contain UTF-8 and will be treated as such.  They become more useful
+    /// when a filter can do something with them (eg: base64 encode them etc.).
+    ///
+    /// This method exists so that a value can be constructed as creating a
+    /// value from a `Vec<u8>` would normally just create a sequence.
+    pub fn from_bytes(value: Vec<u8>) -> Value {
+        ValueRepr::Bytes(value.into()).into()
     }
 
     /// Creates a value from a dynamic object.
@@ -853,36 +1175,97 @@ impl Value {
             }
 
             fn enumerate(self: &Arc<Self>) -> Enumerator {
-                struct Iter {
-                    iter: Box<dyn Iterator<Item = Value> + Send + Sync + 'static>,
-                    _object: DynObject,
-                }
-
-                impl Iterator for Iter {
-                    type Item = Value;
-
-                    fn next(&mut self) -> Option<Self::Item> {
-                        self.iter.next()
-                    }
-
-                    fn size_hint(&self) -> (usize, Option<usize>) {
-                        self.iter.size_hint()
-                    }
-                }
-
-                // SAFETY: this is safe because the object is kept alive by the iter
-                let iter = unsafe {
-                    std::mem::transmute::<
-                        Box<dyn Iterator<Item = _>>,
-                        Box<dyn Iterator<Item = _> + Send + Sync>,
-                    >((self.maker)(&self.object))
-                };
-                let _object = DynObject::new(self.clone());
-                Enumerator::Iter(Box::new(Iter { iter, _object }))
+                mapped_enumerator(self, |this| (this.maker)(&this.object))
             }
         }
 
         Value::from_object(Iterable { maker, object })
+    }
+
+    /// Creates an object projection onto a map.
+    ///
+    /// This is similar to [`make_object_iterable`](Self::make_object_iterable) but
+    /// it creates a map rather than an iterable.  To accomplish this, it also
+    /// requires two callbacks.  One for enumeration, and one for looking up
+    /// attributes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    /// use minijinja::value::{Value, Object, ObjectExt, Enumerator};
+    ///
+    /// #[derive(Debug)]
+    /// struct Element {
+    ///     tag: String,
+    ///     attrs: HashMap<String, String>,
+    /// }
+    ///
+    /// impl Object for Element {
+    ///     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+    ///         match key.as_str()? {
+    ///             "tag" => Some(Value::from(&self.tag)),
+    ///             "attrs" => Some(Value::make_object_map(
+    ///                 self.clone(),
+    ///                 |this| Box::new(this.attrs.keys().map(Value::from)),
+    ///                 |this, key| this.attrs.get(key.as_str()?).map(Value::from),
+    ///             )),
+    ///             _ => None
+    ///         }
+    ///     }
+    ///
+    ///     fn enumerate(self: &Arc<Self>) -> Enumerator {
+    ///         Enumerator::Str(&["tag", "attrs"])
+    ///     }
+    /// }
+    /// ```
+    pub fn make_object_map<T, E, A>(object: T, enumerate_fn: E, attr_fn: A) -> Value
+    where
+        T: Send + Sync + 'static,
+        E: for<'a> Fn(&'a T) -> Box<dyn Iterator<Item = Value> + Send + Sync + 'a>
+            + Send
+            + Sync
+            + 'static,
+        A: Fn(&T, &Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        struct ProxyMapObject<T, E, A> {
+            enumerate_fn: E,
+            attr_fn: A,
+            object: T,
+        }
+
+        impl<T, E, A> fmt::Debug for ProxyMapObject<T, E, A> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("<map-object>").finish()
+            }
+        }
+
+        impl<T, E, A> Object for ProxyMapObject<T, E, A>
+        where
+            T: Send + Sync + 'static,
+            E: for<'a> Fn(&'a T) -> Box<dyn Iterator<Item = Value> + Send + Sync + 'a>
+                + Send
+                + Sync
+                + 'static,
+            A: Fn(&T, &Value) -> Option<Value> + Send + Sync + 'static,
+        {
+            #[inline]
+            fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+                (self.attr_fn)(&self.object, key)
+            }
+
+            #[inline]
+            fn enumerate(self: &Arc<Self>) -> Enumerator {
+                mapped_enumerator(self, |this| (this.enumerate_fn)(&this.object))
+            }
+        }
+
+        Value::from_object(ProxyMapObject {
+            enumerate_fn,
+            attr_fn,
+            object,
+        })
     }
 
     /// Creates a value from a one-shot iterator.
@@ -924,9 +1307,7 @@ impl Value {
     /// ```
     pub fn from_function<F, Rv, Args>(f: F) -> Value
     where
-        // the crazy bounds here exist to enable borrowing in closures
-        F: functions::Function<Rv, Args>
-            + for<'a> functions::Function<Rv, <Args as FunctionArgs<'a>>::Output>,
+        F: functions::Function<Rv, Args>,
         Rv: FunctionResult,
         Args: for<'a> FunctionArgs<'a>,
     {
@@ -939,7 +1320,7 @@ impl Value {
     /// perform operations on it.
     pub fn kind(&self) -> ValueKind {
         match self.0 {
-            ValueRepr::Undefined => ValueKind::Undefined,
+            ValueRepr::Undefined(_) => ValueKind::Undefined,
             ValueRepr::Bool(_) => ValueKind::Bool,
             ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::F64(_) => ValueKind::Number,
             ValueRepr::None => ValueKind::None,
@@ -971,9 +1352,25 @@ impl Value {
         )
     }
 
+    /// Returns true if the number is a real integer.
+    ///
+    /// This can be used to distinguish `42` from `42.0`.  For the most part
+    /// the engine keeps these the same.
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self.0,
+            ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::I128(_) | ValueRepr::U128(_)
+        )
+    }
+
+    /// Returns `true` if the value is a tuple.
+    pub fn is_tuple(&self) -> bool {
+        self.downcast_object_ref::<Tuple>().is_some()
+    }
+
     /// Returns `true` if the map represents keyword arguments.
     pub fn is_kwargs(&self) -> bool {
-        Kwargs::extract(self).is_some()
+        Kwargs::is_kwargs(self)
     }
 
     /// Is this value considered true?
@@ -992,7 +1389,7 @@ impl Value {
             ValueRepr::String(ref x, _) => !x.is_empty(),
             ValueRepr::SmallStr(ref x) => !x.is_empty(),
             ValueRepr::Bytes(ref x) => !x.is_empty(),
-            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => false,
+            ValueRepr::None | ValueRepr::Undefined(_) | ValueRepr::Invalid(_) => false,
             ValueRepr::Object(ref x) => x.is_true(),
         }
     }
@@ -1004,7 +1401,7 @@ impl Value {
 
     /// Returns `true` if this value is undefined.
     pub fn is_undefined(&self) -> bool {
-        matches!(&self.0, ValueRepr::Undefined)
+        matches!(&self.0, ValueRepr::Undefined(_))
     }
 
     /// Returns `true` if this value is none.
@@ -1013,26 +1410,39 @@ impl Value {
     }
 
     /// If the value is a string, return it.
+    ///
+    /// This will also perform a lossy string conversion of bytes from utf-8.
     pub fn to_str(&self) -> Option<Arc<str>> {
-        match &self.0 {
+        match self.0 {
             ValueRepr::String(ref s, _) => Some(s.clone()),
             ValueRepr::SmallStr(ref s) => Some(Arc::from(s.as_str())),
+            ValueRepr::Bytes(ref b) => Some(Arc::from(String::from_utf8_lossy(b))),
             _ => None,
         }
     }
 
     /// If the value is a string, return it.
+    ///
+    /// This will also return well formed utf-8 bytes as string.
     pub fn as_str(&self) -> Option<&str> {
-        match &self.0 {
+        match self.0 {
             ValueRepr::String(ref s, _) => Some(s as &str),
             ValueRepr::SmallStr(ref s) => Some(s.as_str()),
+            ValueRepr::Bytes(ref b) => str::from_utf8(b).ok(),
             _ => None,
         }
     }
 
-    /// If this is an i64 return it
+    /// If this is an usize return it
+    #[inline]
     pub fn as_usize(&self) -> Option<usize> {
-        usize::try_from(self.clone()).ok()
+        // This is manually implemented as the engine calls as_usize a few times
+        // during execution on hotter paths.  This way we can avoid an unnecessary clone.
+        match self.0 {
+            ValueRepr::I64(val) => TryFrom::try_from(val).ok(),
+            ValueRepr::U64(val) => TryFrom::try_from(val).ok(),
+            _ => self.clone().try_into().ok(),
+        }
     }
 
     /// If this is an i64 return it
@@ -1042,7 +1452,7 @@ impl Value {
 
     /// Returns the bytes of this value if they exist.
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match &self.0 {
+        match self.0 {
             ValueRepr::String(ref s, _) => Some(s.as_bytes()),
             ValueRepr::SmallStr(ref s) => Some(s.as_str().as_bytes()),
             ValueRepr::Bytes(ref b) => Some(&b[..]),
@@ -1075,6 +1485,7 @@ impl Value {
         match self.0 {
             ValueRepr::String(ref s, _) => Some(s.chars().count()),
             ValueRepr::SmallStr(ref s) => Some(s.as_str().chars().count()),
+            ValueRepr::Bytes(ref b) => Some(b.len()),
             ValueRepr::Object(ref dy) => dy.enumerator_len(),
             _ => None,
         }
@@ -1098,8 +1509,8 @@ impl Value {
     /// ```
     pub fn get_attr(&self, key: &str) -> Result<Value, Error> {
         let value = match self.0 {
-            ValueRepr::Undefined => return Err(Error::from(ErrorKind::UndefinedError)),
-            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)),
+            ValueRepr::Undefined(_) => return Err(Error::from(ErrorKind::UndefinedError)),
+            ValueRepr::Object(ref dy) => dy.get_value_by_str(key),
             _ => None,
         };
 
@@ -1114,7 +1525,7 @@ impl Value {
     /// also not be created.
     pub(crate) fn get_attr_fast(&self, key: &str) -> Option<Value> {
         match self.0 {
-            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)),
+            ValueRepr::Object(ref dy) => dy.get_value_by_str(key),
             _ => None,
         }
     }
@@ -1149,7 +1560,7 @@ impl Value {
     /// assert_eq!(value.to_string(), "Foo");
     /// ```
     pub fn get_item(&self, key: &Value) -> Result<Value, Error> {
-        if let ValueRepr::Undefined = self.0 {
+        if let ValueRepr::Undefined(_) = self.0 {
             Err(Error::from(ErrorKind::UndefinedError))
         } else {
             Ok(self.get_item_opt(key).unwrap_or(Value::UNDEFINED))
@@ -1183,7 +1594,7 @@ impl Value {
     /// ```
     pub fn try_iter(&self) -> Result<ValueIter, Error> {
         match self.0 {
-            ValueRepr::None | ValueRepr::Undefined => Some(ValueIterImpl::Empty),
+            ValueRepr::None | ValueRepr::Undefined(_) => Some(ValueIterImpl::Empty),
             ValueRepr::String(ref s, _) => {
                 Some(ValueIterImpl::Chars(0, s.chars().count(), Arc::clone(s)))
             }
@@ -1211,18 +1622,18 @@ impl Value {
     /// * undefined or none: value returned unchanged.
     /// * string and bytes: returns a reversed version of that value
     /// * iterables: returns a reversed version of the iterable.  If the iterable is not
-    ///   reversable itself, it consumes it and then reverses it.
+    ///   reversible itself, it consumes it and then reverses it.
     pub fn reverse(&self) -> Result<Value, Error> {
         match self.0 {
-            ValueRepr::Undefined | ValueRepr::None => Some(self.clone()),
+            ValueRepr::Undefined(_) | ValueRepr::None => Some(self.clone()),
             ValueRepr::String(ref s, _) => Some(Value::from(s.chars().rev().collect::<String>())),
             ValueRepr::SmallStr(ref s) => {
                 // TODO: add small str optimization here
                 Some(Value::from(s.as_str().chars().rev().collect::<String>()))
             }
-            ValueRepr::Bytes(ref b) => {
-                Some(Value::from(b.iter().rev().copied().collect::<Vec<_>>()))
-            }
+            ValueRepr::Bytes(ref b) => Some(Value::from_bytes(
+                b.iter().rev().copied().collect::<Vec<_>>(),
+            )),
             ValueRepr::Object(ref o) => match o.enumerate() {
                 Enumerator::NonEnumerable => None,
                 Enumerator::Empty => Some(Value::make_iterable(|| None::<Value>.into_iter())),
@@ -1242,12 +1653,46 @@ impl Value {
                         Box::new(v.iter().cloned())
                     }))
                 }
+                Enumerator::KeyValueIter(iter) => {
+                    let mut v = if let ObjectRepr::Map = o.repr() {
+                        iter.map(|(k, _)| k).collect::<Vec<_>>()
+                    } else {
+                        iter.map(Value::from).collect::<Vec<_>>()
+                    };
+                    v.reverse();
+                    Some(Value::make_object_iterable(v, move |v| {
+                        Box::new(v.iter().cloned())
+                    }))
+                }
                 Enumerator::RevIter(rev_iter) => {
                     let for_restart = self.clone();
                     let iter = Mutex::new(Some(rev_iter));
                     Some(Value::make_iterable(move || {
                         if let Some(iter) = iter.lock().unwrap().take() {
                             Box::new(iter) as Box<dyn Iterator<Item = Value> + Send + Sync>
+                        } else {
+                            match for_restart.reverse().and_then(|x| x.try_iter()) {
+                                Ok(iterable) => Box::new(iterable)
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                                Err(err) => Box::new(Some(Value::from(err)).into_iter())
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                            }
+                        }
+                    }))
+                }
+                Enumerator::RevKeyValueIter(rev_iter) => {
+                    let for_restart = self.clone();
+                    let iter = Mutex::new(Some(rev_iter));
+                    let repr = o.repr();
+                    Some(Value::make_iterable(move || {
+                        if let Some(iter) = iter.lock().unwrap().take() {
+                            if let ObjectRepr::Map = repr {
+                                Box::new(iter.map(|(k, _)| k))
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>
+                            } else {
+                                Box::new(iter.map(Value::from))
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>
+                            }
                         } else {
                             match for_restart.reverse().and_then(|x| x.try_iter()) {
                                 Ok(iterable) => Box::new(iterable)
@@ -1357,6 +1802,10 @@ impl Value {
                 let idx = some!(index(key, || Some(s.as_str().chars().count())));
                 s.as_str().chars().nth(idx).map(Value::from)
             }
+            ValueRepr::Bytes(ref b) => {
+                let idx = some!(index(key, || Some(b.len())));
+                b.get(idx).copied().map(Value::from)
+            }
             _ => None,
         }
     }
@@ -1380,7 +1829,7 @@ impl Value {
     /// # let mut env = Environment::new();
     /// # env.add_template("foo", "").unwrap();
     /// # let tmpl = env.get_template("foo").unwrap();
-    /// # let state = tmpl.new_state(); let state = &state;
+    /// # let mut state = tmpl.new_state(); let state = &mut state;
     /// let func = Value::from_function(|v: i64, kwargs: Kwargs| {
     ///     v * kwargs.get::<i64>("mult").unwrap_or(1)
     /// });
@@ -1402,14 +1851,14 @@ impl Value {
     /// # let mut env = Environment::new();
     /// # env.add_template("foo", "").unwrap();
     /// # let tmpl = env.get_template("foo").unwrap();
-    /// # let state = tmpl.new_state(); let state = &state;
+    /// # let mut state = tmpl.new_state(); let state = &mut state;
     /// let func = Value::from_function(|v: i64, kwargs: Kwargs| {
     ///     v * kwargs.get::<i64>("mult").unwrap_or(1)
     /// });
     /// let rv = func.call(state, args!(42, mult => 2)).unwrap();
     /// assert_eq!(rv, Value::from(84));
     /// ```
-    pub fn call(&self, state: &State, args: &[Value]) -> Result<Value, Error> {
+    pub fn call(&self, state: &mut State, args: &[Value]) -> Result<Value, Error> {
         if let ValueRepr::Object(ref dy) = self.0 {
             dy.call(state, args)
         } else {
@@ -1423,15 +1872,46 @@ impl Value {
     /// Calls a method on the value.
     ///
     /// The name of the method is `name`, the arguments passed are in the `args`
-    /// slice.
-    pub fn call_method(&self, state: &State, name: &str, args: &[Value]) -> Result<Value, Error> {
+    /// slice.  Method lookup first tries methods implemented by the object, then
+    /// the environment's unknown method callback, and finally a callable value
+    /// stored under `name` on the object.
+    pub fn call_method(
+        &self,
+        state: &mut State,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, Error> {
         match self._call_method(state, name, args) {
             Ok(rv) => Ok(rv),
             Err(mut err) => {
                 if err.kind() == ErrorKind::UnknownMethod {
                     if let Some(ref callback) = state.env().unknown_method_callback {
-                        return callback(state, self, name, args);
-                    } else if err.detail().is_none() {
+                        match callback(state, self, name, args) {
+                            Ok(result) => return Ok(result),
+                            Err(callback_err) => {
+                                // if the callback fails with the same error, we
+                                // want to also attach the default detail if
+                                // it's missing
+                                if callback_err.kind() == ErrorKind::UnknownMethod {
+                                    err = callback_err;
+                                } else {
+                                    return Err(callback_err);
+                                }
+                            }
+                        }
+                    }
+                    // Calling values stored on objects by using method syntax is
+                    // supported as a fallback.  This must happen after the unknown
+                    // method callback so that type methods take precedence over
+                    // same-named items, as they do in Jinja2.
+                    if let Some(value) = self
+                        .as_object()
+                        .and_then(|object| object.get_value(&Value::from(name)))
+                    {
+                        return value.call(state, args);
+                    }
+
+                    if err.detail().is_none() {
                         err.set_detail(format!("{} has no method named {}", self.kind(), name));
                     }
                 }
@@ -1440,7 +1920,7 @@ impl Value {
         }
     }
 
-    fn _call_method(&self, state: &State, name: &str, args: &[Value]) -> Result<Value, Error> {
+    fn _call_method(&self, state: &mut State, name: &str, args: &[Value]) -> Result<Value, Error> {
         if let Some(object) = self.as_object() {
             object.call_method(state, name, args)
         } else {
@@ -1460,12 +1940,36 @@ impl Value {
         }
         Ok(rv)
     }
+
+    #[cfg(feature = "builtins")]
+    pub(crate) fn get_path_or_default(&self, path: &str, default: &Value) -> Value {
+        match self.get_path(path) {
+            Err(_) => default.clone(),
+            Ok(val) if val.is_undefined() => default.clone(),
+            Ok(val) => val,
+        }
+    }
 }
 
-impl Serialize for Value {
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize> From<Serde<T>> for Value {
+    fn from(value: Serde<T>) -> Value {
+        INTERNAL_SERIALIZATION.with(|flag| {
+            let old = flag.replace(true);
+            let _serialization_guard = InternalSerializationGuard {
+                flag,
+                reset_on_drop: !old,
+            };
+            crate::value::serialize::transform(value.0)
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::ser::Serializer,
     {
         // enable round tripping of values
         if serializing_for_value() {
@@ -1473,17 +1977,18 @@ impl Serialize for Value {
                 // we are okay with overflowing the handle here because these values only
                 // live for a very short period of time and it's not likely that you run out
                 // of an entire u32 worth of handles in a single serialization operation.
-                // This lets us stick the handle into a unit variant in the serde data model.
                 let rv = x.get().wrapping_add(1);
                 x.set(rv);
                 rv
             });
             VALUE_HANDLES.with(|handles| handles.borrow_mut().insert(handle, self.clone()));
-            return serializer.serialize_unit_variant(
-                VALUE_HANDLE_MARKER,
-                handle,
-                VALUE_HANDLE_MARKER,
-            );
+
+            // we serialize this into a tuple struct as a form of in-band signalling
+            // we can detect.  This also will fail with a somewhat acceptable error
+            // for flattening operations.  See https://github.com/mitsuhiko/minijinja/issues/222
+            let mut s = ok!(serializer.serialize_tuple_struct(VALUE_HANDLE_MARKER, 1));
+            ok!(s.serialize_field(&handle));
+            return s.end();
         }
 
         match self.0 {
@@ -1491,7 +1996,7 @@ impl Serialize for Value {
             ValueRepr::U64(u) => serializer.serialize_u64(u),
             ValueRepr::I64(i) => serializer.serialize_i64(i),
             ValueRepr::F64(f) => serializer.serialize_f64(f),
-            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => {
+            ValueRepr::None | ValueRepr::Undefined(_) | ValueRepr::Invalid(_) => {
                 serializer.serialize_unit()
             }
             ValueRepr::U128(u) => serializer.serialize_u128(u.0),
@@ -1528,6 +2033,39 @@ impl Serialize for Value {
     }
 }
 
+/// Helper to create an iterator proxy that borrows from an object.
+pub(crate) fn mapped_enumerator<F, T>(obj: &Arc<T>, maker: F) -> Enumerator
+where
+    T: Object + 'static,
+    F: for<'a> FnOnce(&'a T) -> Box<dyn Iterator<Item = Value> + Send + Sync + 'a>,
+{
+    struct Iter {
+        iter: Box<dyn Iterator<Item = Value> + Send + Sync + 'static>,
+        _object: DynObject,
+    }
+
+    impl Iterator for Iter {
+        type Item = Value;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.iter.next()
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            self.iter.size_hint()
+        }
+    }
+
+    // SAFETY: this is safe because the object is kept alive by the iter
+    let iter = unsafe {
+        std::mem::transmute::<Box<dyn Iterator<Item = _>>, Box<dyn Iterator<Item = _> + Send + Sync>>(
+            maker(obj),
+        )
+    };
+    let _object = DynObject::new(obj.clone());
+    Enumerator::Iter(Box::new(Iter { iter, _object }))
+}
+
 /// Utility to iterate over values.
 pub struct ValueIter {
     imp: ValueIterImpl,
@@ -1537,16 +2075,16 @@ impl Iterator for ValueIter {
     type Item = Value;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.imp {
+        match self.imp {
             ValueIterImpl::Empty => None,
-            ValueIterImpl::Chars(offset, len, ref s) => {
+            ValueIterImpl::Chars(ref mut offset, ref mut len, ref s) => {
                 (s as &str)[*offset..].chars().next().map(|c| {
                     *offset += c.len_utf8();
                     *len -= 1;
                     Value::from(c)
                 })
             }
-            ValueIterImpl::Dyn(iter) => iter.next(),
+            ValueIterImpl::Dyn(ref mut iter) => iter.next(),
         }
     }
 
@@ -1610,7 +2148,7 @@ mod tests {
         let x = Arc::new(X(Default::default()));
         let x_value = Value::from_dyn_object(x.clone());
         x.0.fetch_add(42, atomic::Ordering::Relaxed);
-        let x_clone = Value::from_serialize(&x_value);
+        let x_clone = Value::from(&x_value);
         x.0.fetch_add(23, atomic::Ordering::Relaxed);
 
         assert_eq!(x_value.to_string(), "65");
@@ -1631,5 +2169,24 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn test_sizes() {
         assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    fn test_cmp_number_no_exact_coercion() {
+        let pow53 = 9007199254740992_i64;
+        let value = Value::from(pow53 + 1);
+
+        assert!(Value::from(1.0) < value);
+        assert!(value > Value::from(1.0));
+
+        let exact_float = Value::from(pow53 as f64);
+        let exact_int = Value::from(pow53);
+        assert_eq!(exact_float.cmp(&exact_int), Ordering::Equal);
+        assert_eq!(exact_float.cmp(&value), Ordering::Less);
+        assert_eq!(exact_int.cmp(&value), Ordering::Less);
+
+        let huge = Value::from(u128::MAX);
+        assert!(Value::from(0_u128) < huge);
+        assert!(Value::from(1_i64) < huge);
     }
 }

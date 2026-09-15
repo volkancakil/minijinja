@@ -1,14 +1,20 @@
 # minijinja-cabi
 
-[![Build Status](https://github.com/mitsuhiko/minijinja/workflows/Tests/badge.svg?branch=main)](https://github.com/mitsuhiko/minijinja/actions?query=workflow%3ATests)
 [![License](https://img.shields.io/github/license/mitsuhiko/minijinja)](https://github.com/mitsuhiko/minijinja/blob/main/LICENSE)
-[![rustc 1.61.0](https://img.shields.io/badge/rust-1.61%2B-orange.svg)](https://img.shields.io/badge/rust-1.61%2B-orange.svg)
 
 `minijinja-cabi` is a crate that wraps
 [MiniJinja](https://github.com/mitsuhiko/minijinja) into a C library.
 This is an experimental and not published crate.
 
 For an example look into [hello.c](example/hello.c).
+
+The C header at `include/minijinja.h` is maintained manually.
+
+Run C ABI smoke tests with:
+
+```bash
+make test
+```
 
 ```c
 #include <minijinja.h>

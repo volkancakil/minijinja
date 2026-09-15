@@ -1,3 +1,4 @@
+import pathlib
 from . import _lowlevel
 
 __all__ = [
@@ -9,6 +10,30 @@ __all__ = [
     "eval_expr",
     "pass_state",
 ]
+
+
+def handle_panic(orig):
+    def decorator(f):
+        from functools import wraps
+
+        @wraps(orig)
+        def protected_call(*args, **kwargs):
+            try:
+                return f(*args, **kwargs)
+            except BaseException as e:
+                if e.__class__.__name__ == "PanicException":
+                    info = _lowlevel.get_panic_info()
+                    message, loc = info or ("unknown panic", None)
+                    raise TemplateError(
+                        "panic during rendering: {} ({})".format(
+                            message, loc or "unknown location"
+                        )
+                    )
+                raise
+
+        return protected_call
+
+    return decorator
 
 
 class Environment(_lowlevel.Environment):
@@ -43,6 +68,7 @@ class Environment(_lowlevel.Environment):
         comment_end_string="#}",
         line_statement_prefix=None,
         line_comment_prefix=None,
+        pycompat=True,
     ):
         super().__init__()
         if loader is not None:
@@ -89,6 +115,15 @@ class Environment(_lowlevel.Environment):
         self.comment_end_string = comment_end_string
         self.line_statement_prefix = line_statement_prefix
         self.line_comment_prefix = line_comment_prefix
+        self.pycompat = pycompat
+
+    @handle_panic(_lowlevel.Environment.render_str)
+    def render_str(self, *args, **kwargs):
+        return super().render_str(*args, **kwargs)
+
+    @handle_panic(_lowlevel.Environment.eval_expr)
+    def eval_expr(self, *args, **kwargs):
+        return super().eval_expr(*args, **kwargs)
 
 
 DEFAULT_ENVIRONMENT = Environment()
@@ -129,6 +164,27 @@ def pass_state(f):
     """Pass the engine state to the function as first argument."""
     f.__minijinja_pass_state__ = True
     return f
+
+
+def load_from_path(paths):
+    """Load a template from one or more paths."""
+    if isinstance(paths, (str, pathlib.Path)):
+        paths = [paths]
+
+    def loader(name):
+        if "\\" in name:
+            return None
+
+        pieces = name.strip("/").split("/")
+        if ".." in pieces:
+            return None
+
+        for path in paths:
+            p = pathlib.Path(path).joinpath(*pieces)
+            if p.is_file():
+                return p.read_text()
+
+    return loader
 
 
 class TemplateError(RuntimeError):
@@ -185,3 +241,6 @@ class TemplateError(RuntimeError):
         if self._info is not None:
             return self._info.full_description
         return self.message
+
+
+del handle_panic

@@ -1,8 +1,9 @@
+use minijinja::value::Serde;
 use minijinja::{context, Environment};
 use serde::Serialize;
 
 /// This struct makes no sense, and serde will fail serializing it.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Copy, Clone)]
 pub struct BadStruct {
     a: i32,
     #[serde(flatten)]
@@ -18,16 +19,16 @@ fn main() {
 
     let good = true;
     let bad = BadStruct { a: 1, b: 2 };
-    let container = context! { good, bad };
-    let ctx = context! { good, bad, container };
+    let container = context! { good, bad => Serde(bad) };
+    let ctx = context! { good, bad => Serde(bad), container };
 
     for name in ["good.txt", "mixed.txt", "bad.txt"] {
         let template = env.get_template(name).unwrap();
-        println!("{}:", name);
+        println!("{name}:");
         println!("  template: {:?}", template.source());
         match template.render(&ctx) {
-            Ok(result) => println!("  result: {}", result),
-            Err(err) => println!("  error: {}", err),
+            Ok(result) => println!("  result: {result}"),
+            Err(err) => println!("  error: {err}"),
         }
     }
 }

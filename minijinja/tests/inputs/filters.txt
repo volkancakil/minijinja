@@ -16,7 +16,13 @@
     "a": "b",
     "c": "d"
   },
-  "scary_html": "<>&'"
+  "scary_html": "<>&'",
+  "list2": [4, 5, 6],
+  "list3": [7, 8],
+  "map2": {
+    "e": "f",
+    "g": "h"
+  }
 }
 ---
 lower: {{ word|lower }}
@@ -24,6 +30,9 @@ upper: {{ word|upper }}
 title: {{ word|title }}
 title-sentence: {{ "the bIrd, is The:word"|title }}
 title-three-words: {{ three_words|title }}
+title-apostrophe: {{ "don't stop believing"|title }}
+title-underscore: {{ "foo_bar.baz"|title }}
+title-brackets: {{ "foo (bar) [baz] {qux} <quux>"|title }}
 capitalize: {{ word|capitalize }}
 capitalize-three-words: {{ three_words|capitalize }}
 replace: {{ word|replace("B", "th") }}
@@ -51,8 +60,12 @@ trim-bird: {{ word|trim("Bd") }}
 join-default: {{ list|join }}
 join-pipe: {{ list|join("|") }}
 join_string: {{ word|join('-') }}
+join-empty-strings: {{ [undefined, "", "blub", "", undefined, 42]|join('|') }}
 default: {{ undefined|default == "" }}
 default-value: {{ undefined|default(42) }}
+default-value-falsy: {{ ""|default("b", true) }}
+d: {{ undefined|d == "" }}
+d-value: {{ undefined|d(42) }}
 first-list: {{ list|first }}
 first-word: {{ word|first }}
 first-undefined: {{ []|first is undefined }}
@@ -81,6 +94,11 @@ slice-fill: {{ range(10)|slice(3, '-') }}
 items: {{ dict(a=1)|items }}
 indent: {{ "foo\nbar\nbaz"|indent(2)|tojson }}
 indent-first-line: {{ "foo\nbar\nbaz"|indent(2, true)|tojson }}
+indent-kwargs-width: {{ "foo\nbar\nbaz"|indent(width=4)|tojson }}
+indent-kwargs-first: {{ "foo\nbar\nbaz"|indent(4, first=true)|tojson }}
+indent-kwargs-blank: {{ "foo\nbar\n\nbaz"|indent(4, first=false, blank=true)|tojson }}
+indent-kwargs-all: {{ "foo\nbar\n\nbaz"|indent(width=2, first=true, blank=true)|tojson }}
+indent-default: {{ "foo\nbar\nbaz"|indent|tojson }}
 int-abs: {{ -42|abs }}
 float-abs: {{ -42.5|abs }}
 int-round: {{ 42|round }}
@@ -101,6 +119,9 @@ map-attr-deep: {{ [dict(a=[1]), dict(a=[2]), dict(a=[])]|map(attribute='a.0', de
 map-attr-int: {{ [[1], [1, 2]]|map(attribute=1, default=999) }}
 attr-filter: {{ map|attr("a") }}
 unique-filter: {{ [1, 1, 1, 4, 3, 0, 0, 5]|unique }}
+unique-filter-ci: {{ ["a", "A", "b", "c", "b", "D", "d"]|unique }}
+unique-filter-cs: {{ ["a", "A", "b", "c", "b", "D", "d"]|unique(case_sensitive=true) }}
+unique-attr-filter: {{ [{'x': 1}, {'x': 1, 'y': 2}, {'x': 2}]|unique }}
 pprint-filter: {{ objects|pprint }}
 int-filter: {{ true|int }}, {{ "42"|int }}, {{ "-23"|int }}, {{ 42.0|int }}, {{ 42.42|int }}, {{ "42.42"|int }}
 float-filter: {{ true|float }}, {{ "42"|float }}, {{ "-23.5"|float }}, {{ 42.5|float }}
@@ -109,3 +130,25 @@ split-at-and: {{ three_words|split(" and ")|list }}
 split-n-ws: {{ three_words|split(none, 1)|list }}
 split-n-d: {{ three_words|split("d", 1)|list }}
 split-n-ws-filter-empty: {{ "  foo    bar baz  "|split(none, 1)|list }}
+split-neg-index: {{ ("1.2.3"|split("."))[-1] }}
+split-neg-2: {{ ("1.2.3"|split("."))[-2] }}
+split-neg-slice: {{ ("1.2.3"|split("."))[-1:] }}
+split-pos-slice: {{ ("1.2.3"|split("."))[1:] }}
+split-as-seq: {{ "1.2.3"|split(".") }}
+sum: {{ range(10)|sum }}
+sum-empty: {{ []|sum }}
+sum-float: {{ [0.5, 1.0]|sum }}
+lines: {{ "foo\nbar\r\nbaz"|lines }}
+string: {{ [1|string, 2|string] }}
+chain-lists: {{ list|chain(list2)|list }}
+chain-multiple: {{ list|chain(list2, list3)|list }}
+chain-maps: {{ map|chain(map2) }}
+chain-and-length: {{ list|chain(list2)|length }}
+chain-iteration: {% for item in list|chain(list2) %}{{ item }}{% if not loop.last %},{% endif %}{% endfor %}
+chain-indexing: {{ (list|chain(list2))[4] }}
+zip-lists: {{ list|zip(list2)|list }}
+zip-multiple: {{ list|zip(list2, list3)|list }}
+zip-different-lengths: {{ list|zip(other_list)|list }}
+zip-iteration: {% for a, b in list|zip(list2) %}{{ a }}-{{ b }}{% if not loop.last %},{% endif %}{% endfor %}
+zip-empty: {{ []|zip(list)|list }}
+zip-single: {{ list|zip()|list }}

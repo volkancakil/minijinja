@@ -1,11 +1,14 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Rest, Value};
-use minijinja::{context, escape_formatter, AutoEscape, Error, State, UndefinedBehavior};
+use minijinja::value::{Rest, Value, ValueOrKwargs};
+use minijinja::{
+    context, escape_formatter, AutoEscape, Error, ErrorKind, State, UndefinedBehavior,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
@@ -103,24 +106,42 @@ struct Inner {
 /// Represents a MiniJinja environment.
 #[pyclass(subclass, module = "minijinja._lowlevel")]
 pub struct Environment {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     reload_before_render: AtomicBool,
+    pycompat: Arc<AtomicBool>,
 }
 
 #[pymethods]
 impl Environment {
     #[new]
     fn py_new() -> PyResult<Self> {
+        let mut env = minijinja::Environment::new();
+        minijinja_contrib::add_to_environment(&mut env);
+
+        let pycompat = Arc::new(AtomicBool::new(false));
+        let pycompat_weak = Arc::downgrade(&pycompat);
+        env.set_unknown_method_callback(move |state, value, method, args| {
+            if let Some(pycompat) = pycompat_weak.upgrade() {
+                if pycompat.load(Ordering::Relaxed) {
+                    return minijinja_contrib::pycompat::unknown_method_callback(
+                        state, value, method, args,
+                    );
+                }
+            }
+            Err(Error::from(ErrorKind::UnknownMethod))
+        });
+
         Ok(Environment {
-            inner: Mutex::new(Inner {
-                env: minijinja::Environment::new(),
+            inner: Arc::new(Mutex::new(Inner {
+                env,
                 loader: None,
                 auto_escape_callback: None,
                 finalizer_callback: None,
                 path_join_callback: None,
                 syntax: None,
-            }),
+            })),
             reload_before_render: AtomicBool::new(false),
+            pycompat,
         })
     }
 
@@ -139,6 +160,19 @@ impl Environment {
         Ok(inner.env.debug())
     }
 
+    /// Enables or disables pycompat mode.
+    #[setter]
+    pub fn set_pycompat(&self, value: bool) -> PyResult<()> {
+        self.pycompat.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Enables or disables pycompat mode.
+    #[getter]
+    pub fn get_pycompat(&self) -> PyResult<bool> {
+        Ok(self.pycompat.load(Ordering::Relaxed))
+    }
+
     /// Sets the undefined behavior.
     #[setter]
     pub fn set_undefined_behavior(&self, value: &str) -> PyResult<()> {
@@ -147,6 +181,7 @@ impl Environment {
             "strict" => UndefinedBehavior::Strict,
             "lenient" => UndefinedBehavior::Lenient,
             "chainable" => UndefinedBehavior::Chainable,
+            "semi_strict" => UndefinedBehavior::SemiStrict,
             _ => {
                 return Err(PyRuntimeError::new_err(
                     "invalid value for undefined behavior",
@@ -164,6 +199,7 @@ impl Environment {
             UndefinedBehavior::Lenient => "lenient",
             UndefinedBehavior::Chainable => "chainable",
             UndefinedBehavior::Strict => "strict",
+            UndefinedBehavior::SemiStrict => "semi_strict",
             _ => {
                 return Err(PyRuntimeError::new_err(
                     "invalid value for undefined behavior",
@@ -196,13 +232,14 @@ impl Environment {
         let callback: Py<PyAny> = callback.clone().unbind();
         self.inner.lock().unwrap().env.add_filter(
             name.to_string(),
-            move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
-                Python::with_gil(|py| {
+            move |state: &mut State, args: Rest<ValueOrKwargs>| -> Result<Value, Error> {
+                Python::attach(|py| {
                     bind_state(state, || {
+                        let args = args.into_values();
                         let (py_args, py_kwargs) = to_python_args(py, callback.bind(py), &args)
                             .map_err(to_minijinja_error)?;
                         let rv = callback
-                            .call_bound(py, py_args, py_kwargs.as_ref())
+                            .call(py, py_args, py_kwargs.as_ref())
                             .map_err(to_minijinja_error)?;
                         Ok(to_minijinja_value(rv.bind(py)))
                     })
@@ -228,13 +265,14 @@ impl Environment {
         let callback: Py<PyAny> = callback.clone().unbind();
         self.inner.lock().unwrap().env.add_test(
             name.to_string(),
-            move |state: &State, args: Rest<Value>| -> Result<bool, Error> {
-                Python::with_gil(|py| {
+            move |state: &mut State, args: Rest<ValueOrKwargs>| -> Result<bool, Error> {
+                Python::attach(|py| {
                     bind_state(state, || {
+                        let args = args.into_values();
                         let (py_args, py_kwargs) = to_python_args(py, callback.bind(py), &args)
                             .map_err(to_minijinja_error)?;
                         let rv = callback
-                            .call_bound(py, py_args, py_kwargs.as_ref())
+                            .call(py, py_args, py_kwargs.as_ref())
                             .map_err(to_minijinja_error)?;
                         Ok(to_minijinja_value(rv.bind(py)).is_true())
                     })
@@ -255,13 +293,14 @@ impl Environment {
         let callback: Py<PyAny> = callback.clone().unbind();
         self.inner.lock().unwrap().env.add_function(
             name.to_string(),
-            move |state: &State, args: Rest<Value>| -> Result<Value, Error> {
-                Python::with_gil(|py| {
+            move |state: &mut State, args: Rest<ValueOrKwargs>| -> Result<Value, Error> {
+                Python::attach(|py| {
                     bind_state(state, || {
+                        let args = args.into_values();
                         let (py_args, py_kwargs) = to_python_args(py, callback.bind(py), &args)
                             .map_err(to_minijinja_error)?;
                         let rv = callback
-                            .call_bound(py, py_args, py_kwargs.as_ref())
+                            .call(py, py_args, py_kwargs.as_ref())
                             .map_err(to_minijinja_error)?;
                         Ok(to_minijinja_value(rv.bind(py)))
                     })
@@ -293,24 +332,38 @@ impl Environment {
         Ok(())
     }
 
+    /// The set of known global variables.
+    #[getter]
+    pub fn globals(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let rv = PyDict::new(py);
+        for (key, value) in self.inner.lock().unwrap().env.globals() {
+            rv.set_item(key, to_python_value(value)?)?;
+        }
+        Ok(rv.unbind())
+    }
+
     /// Sets an auto escape callback.
     ///
     /// Note that because this interface in MiniJinja is infallible, the callback is
     /// not able to raise an error.
     #[setter]
-    pub fn set_auto_escape_callback(&self, callback: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn set_auto_escape_callback(
+        &self,
+        py: Python<'_>,
+        callback: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         if !callback.is_callable() {
             return Err(PyRuntimeError::new_err("expected callback"));
         }
         let callback: Py<PyAny> = callback.clone().unbind();
         let mut inner = self.inner.lock().unwrap();
-        inner.auto_escape_callback = Some(callback.clone());
+        inner.auto_escape_callback = Some(callback.clone_ref(py));
         inner
             .env
             .set_auto_escape_callback(move |name: &str| -> AutoEscape {
-                Python::with_gil(|py| {
-                    let py_args = PyTuple::new_bound(py, [name]);
-                    let rv = match callback.call_bound(py, py_args, None) {
+                Python::attach(|py| {
+                    let py_args = PyTuple::new(py, [name]).unwrap();
+                    let rv = match callback.call(py, py_args, None) {
                         Ok(value) => value,
                         Err(err) => {
                             report_unraisable(py, err);
@@ -341,31 +394,37 @@ impl Environment {
     }
 
     #[getter]
-    pub fn get_auto_escape_callback(&self) -> PyResult<Option<Py<PyAny>>> {
-        Ok(self.inner.lock().unwrap().auto_escape_callback.clone())
+    pub fn get_auto_escape_callback(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .auto_escape_callback
+            .as_ref()
+            .map(|x| x.clone_ref(py)))
     }
 
     /// Sets a finalizer.
     ///
     /// A finalizer is called before a value is rendered to customize it.
     #[setter]
-    pub fn set_finalizer(&self, callback: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn set_finalizer(&self, py: Python<'_>, callback: &Bound<'_, PyAny>) -> PyResult<()> {
         if !callback.is_callable() {
             return Err(PyRuntimeError::new_err("expected callback"));
         }
         let callback: Py<PyAny> = callback.clone().unbind();
         let mut inner = self.inner.lock().unwrap();
-        inner.finalizer_callback = Some(callback.clone());
+        inner.finalizer_callback = Some(callback.clone_ref(py));
         inner.env.set_formatter(move |output, state, value| {
-            Python::with_gil(|py| -> Result<(), Error> {
+            Python::attach(|py| -> Result<(), Error> {
                 let maybe_new_value = bind_state(state, || -> Result<_, Error> {
                     let args = std::slice::from_ref(value);
                     let (py_args, py_kwargs) =
                         to_python_args(py, callback.bind(py), args).map_err(to_minijinja_error)?;
                     let rv = callback
-                        .call_bound(py, py_args, py_kwargs.as_ref())
+                        .call(py, py_args, py_kwargs.as_ref())
                         .map_err(to_minijinja_error)?;
-                    if rv.is(&py.NotImplemented()) {
+                    if rv.is(py.NotImplemented()) {
                         Ok(None)
                     } else {
                         Ok(Some(to_minijinja_value(rv.bind(py))))
@@ -382,8 +441,14 @@ impl Environment {
     }
 
     #[getter]
-    pub fn get_finalizer(&self) -> PyResult<Option<Py<PyAny>>> {
-        Ok(self.inner.lock().unwrap().finalizer_callback.clone())
+    pub fn get_finalizer(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .finalizer_callback
+            .as_ref()
+            .map(|x| x.clone_ref(py)))
     }
 
     /// Sets a loader function for the environment.
@@ -392,7 +457,7 @@ impl Environment {
     /// template exists the source code of the template should be returned a string,
     /// otherwise `None` can be used to indicate that the template does not exist.
     #[setter]
-    pub fn set_loader(&self, callback: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    pub fn set_loader(&self, py: Python<'_>, callback: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let callback = match callback {
             None => None,
             Some(callback) => {
@@ -403,14 +468,14 @@ impl Environment {
             }
         };
         let mut inner = self.inner.lock().unwrap();
-        inner.loader.clone_from(&callback);
+        inner.loader = callback.as_ref().map(|x| x.clone_ref(py));
 
         if let Some(callback) = callback {
             inner.env.set_loader(move |name| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let callback = callback.bind(py);
                     let rv = callback
-                        .call1(PyTuple::new_bound(py, [name]))
+                        .call1(PyTuple::new(py, [name]).unwrap())
                         .map_err(to_minijinja_error)?;
                     if rv.is_none() {
                         Ok(None)
@@ -426,23 +491,32 @@ impl Environment {
 
     /// Returns the current loader.
     #[getter]
-    pub fn get_loader(&self) -> Option<Py<PyAny>> {
-        self.inner.lock().unwrap().loader.clone()
+    pub fn get_loader(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .loader
+            .as_ref()
+            .map(|x| x.clone_ref(py))
     }
 
     /// Sets a new path join callback.
     #[setter]
-    pub fn set_path_join_callback(&self, callback: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub fn set_path_join_callback(
+        &self,
+        py: Python<'_>,
+        callback: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         if !callback.is_callable() {
             return Err(PyRuntimeError::new_err("expected callback"));
         }
         let callback: Py<PyAny> = callback.clone().unbind();
         let mut inner = self.inner.lock().unwrap();
-        inner.path_join_callback = Some(callback.clone());
+        inner.path_join_callback = Some(callback.clone_ref(py));
         inner.env.set_path_join_callback(move |name, parent| {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let callback = callback.bind(py);
-                match callback.call1(PyTuple::new_bound(py, [name, parent])) {
+                match callback.call1(PyTuple::new(py, [name, parent]).unwrap()) {
                     Ok(rv) => Cow::Owned(rv.to_string()),
                     Err(err) => {
                         report_unraisable(py, err);
@@ -456,14 +530,19 @@ impl Environment {
 
     /// Returns the current path join callback.
     #[getter]
-    pub fn get_path_join_callback(&self) -> Option<Py<PyAny>> {
-        self.inner.lock().unwrap().path_join_callback.clone()
+    pub fn get_path_join_callback(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .path_join_callback
+            .as_ref()
+            .map(|x| x.clone_ref(py))
     }
 
     /// Triggers a reload of the templates.
-    pub fn reload(&self) -> PyResult<()> {
+    pub fn reload(&self, py: Python<'_>) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
-        let loader = inner.loader.as_ref().cloned();
+        let loader = inner.loader.as_ref().map(|x| x.clone_ref(py));
         if loader.is_some() {
             inner.env.clear_templates();
         }
@@ -633,19 +712,59 @@ impl Environment {
     #[pyo3(signature = (template_name, /, **ctx))]
     pub fn render_template(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         template_name: &str,
         ctx: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<String> {
         if slf.reload_before_render.load(Ordering::Relaxed) {
-            slf.reload()?;
+            slf.reload(py)?;
+        }
+        let ctx = ctx
+            .map(|ctx| Value::from_object(DynamicObject::new(ctx.as_any().clone().unbind())))
+            .unwrap_or_else(|| context!());
+        bind_environment(slf.as_ptr(), || {
+            let inner = slf.inner.clone();
+            py.detach(move || {
+                let inner = inner.lock().unwrap();
+                let tmpl = inner.env.get_template(template_name).map_err(to_py_error)?;
+                tmpl.render(ctx).map_err(to_py_error)
+            })
+        })
+    }
+
+    /// Finds undeclared variables in a template.
+    #[pyo3(signature = (template_name, nested = false))]
+    pub fn undeclared_variables_in_template(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        template_name: &str,
+        nested: bool,
+    ) -> PyResult<HashSet<String>> {
+        if slf.reload_before_render.load(Ordering::Relaxed) {
+            slf.reload(py)?;
         }
         bind_environment(slf.as_ptr(), || {
             let inner = slf.inner.lock().unwrap();
             let tmpl = inner.env.get_template(template_name).map_err(to_py_error)?;
-            let ctx = ctx
-                .map(|ctx| Value::from_object(DynamicObject::new(ctx.as_any().clone().unbind())))
-                .unwrap_or_else(|| context!());
-            tmpl.render(ctx).map_err(to_py_error)
+            Ok(tmpl.undeclared_variables(nested))
+        })
+    }
+
+    /// Finds undeclared variables in a template string.
+    #[pyo3(signature = (source, nested = false))]
+    pub fn undeclared_variables_in_str(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        source: &str,
+        nested: bool,
+    ) -> PyResult<HashSet<String>> {
+        if slf.reload_before_render.load(Ordering::Relaxed) {
+            slf.reload(py)?;
+        }
+        bind_environment(slf.as_ptr(), || {
+            let inner = slf.inner.lock().unwrap();
+            let tmpl = inner.env.template_from_str(source).map_err(to_py_error)?;
+            Ok(tmpl.undeclared_variables(nested))
         })
     }
 
@@ -656,6 +775,7 @@ impl Environment {
     #[pyo3(signature = (source, name=None, /, **ctx))]
     pub fn render_str(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         source: &str,
         name: Option<&str>,
         ctx: Option<&Bound<'_, PyDict>>,
@@ -664,12 +784,15 @@ impl Environment {
             let ctx = ctx
                 .map(|ctx| Value::from_object(DynamicObject::new(ctx.as_any().clone().unbind())))
                 .unwrap_or_else(|| context!());
-            slf.inner
-                .lock()
-                .unwrap()
-                .env
-                .render_named_str(name.unwrap_or("<string>"), source, ctx)
-                .map_err(to_py_error)
+            let inner = slf.inner.clone();
+            py.detach(move || {
+                inner
+                    .lock()
+                    .unwrap()
+                    .env
+                    .render_named_str(name.unwrap_or("<string>"), source, ctx)
+                    .map_err(to_py_error)
+            })
         })
     }
 
@@ -677,34 +800,39 @@ impl Environment {
     #[pyo3(signature = (expression, /, **ctx))]
     pub fn eval_expr(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         expression: &str,
         ctx: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         bind_environment(slf.as_ptr(), || {
-            let inner = slf.inner.lock().unwrap();
-            let expr = inner
-                .env
-                .compile_expression(expression)
-                .map_err(to_py_error)?;
+            let inner = slf.inner.clone();
             let ctx = ctx
                 .map(|ctx| Value::from_object(DynamicObject::new(ctx.as_any().clone().unbind())))
                 .unwrap_or_else(|| context!());
-            to_python_value(expr.eval(ctx).map_err(to_py_error)?)
+            py.detach(move || {
+                let inner = inner.lock().unwrap();
+                let expr = inner
+                    .env
+                    .compile_expression(expression)
+                    .map_err(to_py_error)?;
+                to_python_value(expr.eval(ctx).map_err(to_py_error)?)
+            })
         })
     }
 }
 
-pub fn with_environment<R, F: FnOnce(Py<Environment>) -> PyResult<R>>(f: F) -> PyResult<R> {
-    Python::with_gil(|py| {
-        CURRENT_ENV.with(|handle| {
-            let ptr = handle.load(Ordering::Relaxed) as *mut _;
-            match unsafe { Py::<Environment>::from_borrowed_ptr_or_opt(py, ptr) } {
-                Some(env) => f(env),
-                None => Err(PyRuntimeError::new_err(
-                    "environment cannot be used outside of template render",
-                )),
-            }
-        })
+pub fn with_environment<R, F: FnOnce(Py<Environment>) -> PyResult<R>>(
+    py: Python<'_>,
+    f: F,
+) -> PyResult<R> {
+    CURRENT_ENV.with(|handle| {
+        let ptr = handle.load(Ordering::Relaxed) as *mut _;
+        match unsafe { Py::<Environment>::from_borrowed_ptr_or_opt(py, ptr) } {
+            Some(env) => f(env),
+            None => Err(PyRuntimeError::new_err(
+                "environment cannot be used outside of template render",
+            )),
+        }
     })
 }
 

@@ -5,22 +5,20 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind};
-use crate::utils::UndefinedBehavior;
 use crate::value::{
-    DynObject, ObjectRepr, Packed, SmallStr, StringType, Value, ValueKind, ValueMap, ValueRepr,
+    DynObject, ObjectExt, ObjectRepr, Packed, SmallStr, StringType, Value, ValueKind, ValueMap,
+    ValueRepr,
 };
 use crate::vm::State;
 
 use super::{Enumerator, Object};
 
-/// A utility trait that represents the return value of functions and filters.
+/// A utility trait that represents the return value of functions, filters and tests.
 ///
 /// It's implemented for the following types:
 ///
 /// * `Rv` where `Rv` implements `Into<AnyMapObject>`
 /// * `Result<Rv, Error>` where `Rv` implements `Into<Value>`
-///
-/// The equivalent for test functions is [`TestResult`](crate::tests::TestResult).
 pub trait FunctionResult {
     #[doc(hidden)]
     fn into_result(self) -> Result<Value, Error>;
@@ -55,6 +53,12 @@ pub trait FunctionArgs<'a> {
     /// Converts to function arguments from a slice of values.
     #[doc(hidden)]
     fn from_values(state: Option<&'a State>, values: &'a [Value]) -> Result<Self::Output, Error>;
+
+    /// Converts arguments for a function that receives mutable state.
+    #[doc(hidden)]
+    fn from_values_mut(_state: Option<&State>, values: &'a [Value]) -> Result<Self::Output, Error> {
+        Self::from_values(None, values)
+    }
 }
 
 /// Utility function to convert a slice of values into arguments.
@@ -102,17 +106,16 @@ where
 /// types that are typically passed to filters, tests or functions.  It's
 /// implemented for the following types:
 ///
-/// * eval state: [`&State`](crate::State) (see below for notes)
 /// * unsigned integers: [`u8`], [`u16`], [`u32`], [`u64`], [`u128`], [`usize`]
 /// * signed integers: [`i8`], [`i16`], [`i32`], [`i64`], [`i128`]
 /// * floats: [`f32`], [`f64`]
 /// * bool: [`bool`]
-/// * string: [`String`], [`&str`], `Cow<'_, str>`, [`char`]
+/// * string: [`String`], [`&str`], `Cow<'_, str>`, [`StringInput`], [`char`]
 /// * bytes: [`&[u8]`][`slice`]
-/// * values: [`Value`], `&Value`
+/// * values: [`Value`], `&Value`, [`ValueOrKwargs`]
 /// * vectors: [`Vec<T>`]
 /// * objects: [`DynObject`], [`Arc<T>`], `&T` (where `T` is an [`Object`])
-/// * serde deserializable: [`ViaDeserialize<T>`](crate::value::deserialize::ViaDeserialize)
+/// * Serde deserializable: `Serde<T>`
 /// * keyword arguments: [`Kwargs`]
 /// * leftover arguments: [`Rest<T>`]
 ///
@@ -136,11 +139,9 @@ where
 /// For instance you cannot implicitly borrow out of sequences which means that
 /// for instance `Vec<&str>` is not a legal argument.
 ///
-/// ## Notes on State
-///
-/// When `&State` is used, it does not consume a passed parameter.  This means that
-/// a filter that takes `(&State, String)` actually only has one argument.  The
-/// state is passed implicitly.
+/// When `&State` is used, it does not consume a passed parameter.  Mutable state
+/// is handled specially by [`Function`](crate::functions::Function) and can only
+/// be used as the first parameter.
 pub trait ArgType<'a> {
     /// The output type of this argument.
     type Output;
@@ -157,19 +158,19 @@ pub trait ArgType<'a> {
     }
 
     #[doc(hidden)]
+    fn from_state_and_value_owned(
+        _state: Option<&'a State>,
+        value: Value,
+    ) -> Result<Self::Output, Error> {
+        Self::from_value_owned(value)
+    }
+
+    #[doc(hidden)]
     fn from_state_and_value(
-        state: Option<&'a State>,
+        _state: Option<&'a State>,
         value: Option<&'a Value>,
     ) -> Result<(Self::Output, usize), Error> {
-        if value.map_or(false, |x| x.is_undefined())
-            && state.map_or(false, |x| {
-                matches!(x.undefined_behavior(), UndefinedBehavior::Strict)
-            })
-        {
-            Err(Error::from(ErrorKind::UndefinedError))
-        } else {
-            Ok((ok!(Self::from_value(value)), 1))
-        }
+        Ok((ok!(Self::from_value(value)), 1))
     }
 
     #[doc(hidden)]
@@ -182,11 +183,79 @@ pub trait ArgType<'a> {
         Self::from_state_and_value(state, values.get(offset))
     }
 
+    /// Converts an owned argument without allowing the result to borrow state.
+    #[doc(hidden)]
+    fn from_state_and_value_owned_mut(
+        _state: Option<&State>,
+        value: Value,
+    ) -> Result<Self::Output, Error> {
+        Self::from_value_owned(value)
+    }
+
+    /// Converts an argument without allowing the result to borrow state.
+    #[doc(hidden)]
+    fn from_state_and_value_mut(
+        _state: Option<&State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        Ok((ok!(Self::from_value(value)), 1))
+    }
+
+    /// Converts arguments without allowing the result to borrow state.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn from_state_and_values_mut(
+        state: Option<&State>,
+        values: &'a [Value],
+        offset: usize,
+    ) -> Result<(Self::Output, usize), Error> {
+        Self::from_state_and_value_mut(state, values.get(offset))
+    }
+
     #[doc(hidden)]
     #[inline(always)]
     fn is_trailing() -> bool {
         false
     }
+}
+
+macro_rules! convert_function_args {
+    ($state:expr, $values:expr, $convert:ident, ($($name:ident,)*), $rest_name:ident) => {{
+        #![allow(non_snake_case)]
+        let mut values = $values;
+        $(let $name;)*
+        let mut $rest_name = None;
+        let mut idx = 0;
+
+        // A trailing type such as Kwargs is read first so that conversions such
+        // as from_args::<(&[Value], Kwargs)> can split the argument list.
+        let rest_first = $rest_name::is_trailing() && !values.is_empty();
+        if rest_first {
+            let (val, offset) = ok!($rest_name::$convert(
+                $state,
+                values,
+                values.len() - 1,
+            ));
+            $rest_name = Some(val);
+            values = &values[..values.len() - offset];
+        }
+        $(
+            let (val, offset) = ok!($name::$convert($state, values, idx));
+            $name = val;
+            idx += offset;
+        )*
+        if !rest_first {
+            let (val, offset) = ok!($rest_name::$convert($state, values, idx));
+            $rest_name = Some(val);
+            idx += offset;
+        }
+
+        if values.get(idx).is_some() {
+            Err(Error::from(ErrorKind::TooManyArguments))
+        } else {
+            Ok(($($name,)* $rest_name.expect("trailing argument was not converted"),))
+        }
+    }};
 }
 
 macro_rules! tuple_impls {
@@ -196,41 +265,24 @@ macro_rules! tuple_impls {
         {
             type Output = ($($name::Output,)* $rest_name::Output ,);
 
-            fn from_values(state: Option<&'a State>, mut values: &'a [Value]) -> Result<Self::Output, Error> {
-                #![allow(non_snake_case, unused)]
-                $( let $name; )*
-                let mut $rest_name = None;
-                let mut idx = 0;
+            fn from_values(state: Option<&'a State>, values: &'a [Value]) -> Result<Self::Output, Error> {
+                convert_function_args!(
+                    state,
+                    values,
+                    from_state_and_values,
+                    ($($name,)*),
+                    $rest_name
+                )
+            }
 
-                // special case: the last type is marked trailing (eg: for Kwargs) and we have at
-                // least one value.  In that case we need to read it first before going to the rest
-                // of the arguments.  This is needed to support from_args::<(&[Value], Kwargs)>
-                // or similar.
-                let rest_first = $rest_name::is_trailing() && !values.is_empty();
-                if rest_first {
-                    let (val, offset) = ok!($rest_name::from_state_and_values(state, values, values.len() - 1));
-                    $rest_name = Some(val);
-                    values = &values[..values.len() - offset];
-                }
-                $(
-                    let (val, offset) = ok!($name::from_state_and_values(state, values, idx));
-                    $name = val;
-                    idx += offset;
-                )*
-
-                if !rest_first {
-                    let (val, offset) = ok!($rest_name::from_state_and_values(state, values, idx));
-                    $rest_name = Some(val);
-                    idx += offset;
-                }
-
-                if values.get(idx).is_some() {
-                    Err(Error::from(ErrorKind::TooManyArguments))
-                } else {
-                    // SAFETY: this is safe because both no batter what `rest_first` is set to
-                    // either way the variable is set.
-                    Ok(($($name,)* unsafe { $rest_name.unwrap_unchecked() },))
-                }
+            fn from_values_mut(state: Option<&State>, values: &'a [Value]) -> Result<Self::Output, Error> {
+                convert_function_args!(
+                    state,
+                    values,
+                    from_state_and_values_mut,
+                    ($($name,)*),
+                    $rest_name
+                )
             }
         }
     };
@@ -261,6 +313,13 @@ impl From<ValueRepr> for Value {
     }
 }
 
+impl From<&Value> for Value {
+    #[inline(always)]
+    fn from(value: &Value) -> Value {
+        value.clone()
+    }
+}
+
 impl<'a> From<&'a [u8]> for Value {
     #[inline(always)]
     fn from(val: &'a [u8]) -> Self {
@@ -273,7 +332,7 @@ impl<'a> From<&'a str> for Value {
     fn from(val: &'a str) -> Self {
         SmallStr::try_new(val)
             .map(|small_str| Value(ValueRepr::SmallStr(small_str)))
-            .unwrap_or_else(|| Value::from(val.to_string()))
+            .unwrap_or_else(|| Value(ValueRepr::String(val.into(), StringType::Normal)))
     }
 }
 
@@ -287,7 +346,9 @@ impl<'a> From<&'a String> for Value {
 impl From<String> for Value {
     #[inline(always)]
     fn from(val: String) -> Self {
-        ValueRepr::String(Arc::from(val), StringType::Normal).into()
+        // There is no benefit here of "reusing" the string allocation.  The reason
+        // is that From<String> for Arc<str> copies the bytes over anyways.
+        Value::from(val.as_str())
     }
 }
 
@@ -301,9 +362,22 @@ impl<'a> From<Cow<'a, str>> for Value {
     }
 }
 
+impl From<&Cow<'_, str>> for Value {
+    #[inline(always)]
+    fn from(val: &Cow<'_, str>) -> Self {
+        Value::from(val.as_ref())
+    }
+}
+
 impl From<Arc<str>> for Value {
     fn from(value: Arc<str>) -> Self {
         Value(ValueRepr::String(value, StringType::Normal))
+    }
+}
+
+impl From<&Arc<str>> for Value {
+    fn from(value: &Arc<str>) -> Self {
+        Value::from(value.clone())
     }
 }
 
@@ -314,19 +388,22 @@ impl From<()> for Value {
     }
 }
 
-impl<V: Into<Value>> FromIterator<V> for Value {
-    fn from_iter<T: IntoIterator<Item = V>>(iter: T) -> Self {
-        Value::from_object(iter.into_iter().map(Into::into).collect::<Vec<Value>>())
+impl From<&()> for Value {
+    #[inline(always)]
+    fn from(_: &()) -> Self {
+        ValueRepr::None.into()
     }
 }
 
-impl<K: Into<Value>, V: Into<Value>> FromIterator<(K, V)> for Value {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        Value::from_object(
-            iter.into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect::<ValueMap>(),
-        )
+impl From<&[Value]> for Value {
+    fn from(value: &[Value]) -> Self {
+        value.iter().cloned().collect()
+    }
+}
+
+impl<V: Into<Value>> FromIterator<V> for Value {
+    fn from_iter<T: IntoIterator<Item = V>>(iter: T) -> Self {
+        Value::from_object(iter.into_iter().map(Into::into).collect::<Vec<Value>>())
     }
 }
 
@@ -338,6 +415,19 @@ macro_rules! value_from {
                 ValueRepr::$dst(val as _).into()
             }
         }
+    };
+}
+
+macro_rules! value_from_copy_ref {
+    ($($src:ty),*) => {
+        $(
+            impl From<&$src> for Value {
+                #[inline(always)]
+                fn from(val: &$src) -> Self {
+                    Value::from(*val)
+                }
+            }
+        )*
     };
 }
 
@@ -376,6 +466,21 @@ value_from!(f32, F64);
 value_from!(f64, F64);
 value_from!(Arc<Vec<u8>>, Bytes);
 value_from!(DynObject, Object);
+value_from_copy_ref!(
+    bool, char, usize, isize, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64
+);
+
+impl From<&Arc<Vec<u8>>> for Value {
+    fn from(value: &Arc<Vec<u8>>) -> Self {
+        Value::from(value.clone())
+    }
+}
+
+impl From<&DynObject> for Value {
+    fn from(value: &DynObject) -> Self {
+        Value::from(value.clone())
+    }
+}
 
 fn unsupported_conversion(kind: ValueKind, target: &str) -> Error {
     Error::new(
@@ -440,6 +545,7 @@ primitive_int_try_from!(i32);
 primitive_int_try_from!(i64);
 primitive_int_try_from!(i128);
 primitive_int_try_from!(usize);
+primitive_int_try_from!(isize);
 
 primitive_try_from!(bool, {
     ValueRepr::Bool(val) => val,
@@ -493,6 +599,7 @@ impl TryFrom<Value> for Arc<str> {
         match value.0 {
             ValueRepr::String(x, _) => Ok(x),
             ValueRepr::SmallStr(x) => Ok(Arc::from(x.as_str())),
+            ValueRepr::Bytes(ref x) => Ok(Arc::from(String::from_utf8_lossy(x))),
             _ => Err(Error::new(
                 ErrorKind::InvalidOperation,
                 "value is not a string",
@@ -550,19 +657,166 @@ impl<'a, T: ArgType<'a>> ArgType<'a> for Option<T> {
     }
 }
 
+fn value_to_string_cow(value: &Value) -> Result<Cow<'_, str>, Error> {
+    Ok(match value.0 {
+        ValueRepr::String(ref s, _) => Cow::Borrowed(s as &str),
+        ValueRepr::SmallStr(ref s) => Cow::Borrowed(s.as_str()),
+        ValueRepr::U64(v) => Cow::Owned(v.to_string()),
+        ValueRepr::I64(v) => Cow::Owned(v.to_string()),
+        ValueRepr::Bool(v) => Cow::Borrowed(if v { "True" } else { "False" }),
+        _ => {
+            if value.is_kwargs() {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "cannot convert kwargs to string",
+                ));
+            }
+            Cow::Owned(value.to_string())
+        }
+    })
+}
+
+/// A string coerced from a value together with its safety provenance.
+///
+/// `StringInput` can be used as an argument to filters and functions when a
+/// string transformation needs to account for whether the input value was
+/// marked safe.  Unlike [`String`] and [`Cow<str>`], it retains that information
+/// during argument conversion.
+///
+/// It intentionally does not dereference to `str`, since doing so would make it
+/// easy to apply a string transformation and accidentally discard the safety
+/// provenance.
+///
+/// ```
+/// # use minijinja::{Environment, Value};
+/// use minijinja::value::StringInput;
+///
+/// fn shout(value: StringInput<'_>) -> Value {
+///     let output = value.as_str().to_uppercase();
+///     value.preserve_safety(output)
+/// }
+///
+/// # let mut env = Environment::new();
+/// env.add_filter("shout", shout);
+/// ```
+#[derive(Debug)]
+pub struct StringInput<'a> {
+    value: Cow<'a, str>,
+    safe: bool,
+}
+
+impl<'a> StringInput<'a> {
+    /// Coerces a value into a string while retaining its safety provenance.
+    ///
+    /// This applies the state's undefined behavior in the same way as automatic
+    /// string argument conversion.
+    pub fn new(state: &State, value: &'a Value) -> Result<Self, Error> {
+        ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        Self::from_value(value)
+    }
+
+    fn from_value(value: &'a Value) -> Result<Self, Error> {
+        Ok(StringInput {
+            value: ok!(value_to_string_cow(value)),
+            safe: value.is_safe(),
+        })
+    }
+
+    /// Returns the coerced string.
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// Returns `true` if the original value was marked safe.
+    pub fn is_safe(&self) -> bool {
+        self.safe
+    }
+
+    /// Formats the string for insertion into a safe result.
+    ///
+    /// Safe inputs are returned unchanged.  Other inputs are escaped in the
+    /// same way as the [`escape`](crate::filters::escape) filter.
+    pub fn format(&self, state: &mut State) -> Result<Cow<'_, str>, Error> {
+        if self.safe {
+            Ok(Cow::Borrowed(self.as_str()))
+        } else {
+            Ok(Cow::Owned(
+                crate::filters::escape(state, &Value::from(self.as_str()))?
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Wraps a derived string while preserving the input's safety.
+    ///
+    /// This should only be used when the output is derived entirely from this
+    /// input and does not introduce other potentially unsafe content.
+    pub fn preserve_safety(&self, value: String) -> Value {
+        if self.safe {
+            Value::from_safe_string(value)
+        } else {
+            Value::from(value)
+        }
+    }
+}
+
+impl<'a> ArgType<'a> for StringInput<'_> {
+    type Output = StringInput<'a>;
+
+    fn from_value(value: Option<&'a Value>) -> Result<Self::Output, Error> {
+        match value {
+            Some(value) => StringInput::from_value(value),
+            None => Err(Error::from(ErrorKind::MissingArgument)),
+        }
+    }
+
+    fn from_state_and_value(
+        state: Option<&'a State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        Self::from_state_and_value_mut(state, value)
+    }
+
+    fn from_state_and_value_mut(
+        state: Option<&State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        let value = value.ok_or_else(|| Error::from(ErrorKind::MissingArgument))?;
+        if let Some(state) = state {
+            ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        }
+        Ok((ok!(StringInput::from_value(value)), 1))
+    }
+}
+
 impl<'a> ArgType<'a> for Cow<'_, str> {
     type Output = Cow<'a, str>;
 
     #[inline(always)]
     fn from_value(value: Option<&'a Value>) -> Result<Cow<'a, str>, Error> {
         match value {
-            Some(value) => Ok(match value.0 {
-                ValueRepr::String(ref s, _) => Cow::Borrowed(s as &str),
-                ValueRepr::SmallStr(ref s) => Cow::Borrowed(s.as_str()),
-                _ => Cow::Owned(value.to_string()),
-            }),
+            Some(value) => value_to_string_cow(value),
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
+    }
+
+    fn from_state_and_value(
+        state: Option<&'a State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        Self::from_state_and_value_mut(state, value)
+    }
+
+    fn from_state_and_value_mut(
+        state: Option<&State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        if let (Some(state), Some(value)) = (state, value) {
+            ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        }
+        Ok((ok!(Self::from_value(value)), 1))
     }
 }
 
@@ -572,7 +826,8 @@ impl<'a> ArgType<'a> for &Value {
     #[inline(always)]
     fn from_value(value: Option<&'a Value>) -> Result<&'a Value, Error> {
         match value {
-            Some(value) => Ok(value),
+            Some(value) if !value.is_kwargs() => Ok(value),
+            Some(_) => Err(unexpected_kwargs()),
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
     }
@@ -584,7 +839,8 @@ impl<'a> ArgType<'a> for &[Value] {
     #[inline(always)]
     fn from_value(value: Option<&'a Value>) -> Result<&'a [Value], Error> {
         match value {
-            Some(value) => Ok(std::slice::from_ref(value)),
+            Some(value) if !value.is_kwargs() => Ok(std::slice::from_ref(value)),
+            Some(_) => Err(unexpected_kwargs()),
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
     }
@@ -594,7 +850,18 @@ impl<'a> ArgType<'a> for &[Value] {
         values: &'a [Value],
         offset: usize,
     ) -> Result<(&'a [Value], usize), Error> {
+        Self::from_state_and_values_mut(None, values, offset)
+    }
+
+    fn from_state_and_values_mut(
+        _state: Option<&State>,
+        values: &'a [Value],
+        offset: usize,
+    ) -> Result<(&'a [Value], usize), Error> {
         let args = values.get(offset..).unwrap_or_default();
+        if args.iter().any(Value::is_kwargs) {
+            return Err(unexpected_kwargs());
+        }
         Ok((args, args.len()))
     }
 }
@@ -630,8 +897,7 @@ impl<'a, T: Object + 'static> ArgType<'a> for Arc<T> {
 /// Utility type to capture remaining arguments.
 ///
 /// In some cases you might want to have a variadic function.  In that case
-/// you can define the last argument to a [`Filter`](crate::filters::Filter),
-/// [`Test`](crate::tests::Test) or [`Function`](crate::functions::Function)
+/// you can define the last argument to a [`Function`](crate::functions::Function)
 /// this way.  The `Rest<T>` type will collect all the remaining arguments
 /// here.  It's implemented for all [`ArgType`]s.  The type itself deref's
 /// into the inner vector.
@@ -663,6 +929,13 @@ impl<T> DerefMut for Rest<T> {
     }
 }
 
+impl Rest<ValueOrKwargs> {
+    /// Converts the captured arguments back into their underlying values.
+    pub fn into_values(self) -> Vec<Value> {
+        self.0.into_iter().map(ValueOrKwargs::into_value).collect()
+    }
+}
+
 impl<'a, T: ArgType<'a, Output = T>> ArgType<'a> for Rest<T> {
     type Output = Self;
 
@@ -674,7 +947,7 @@ impl<'a, T: ArgType<'a, Output = T>> ArgType<'a> for Rest<T> {
     }
 
     fn from_state_and_values(
-        _state: Option<&'a State>,
+        state: Option<&'a State>,
         values: &'a [Value],
         offset: usize,
     ) -> Result<(Self, usize), Error> {
@@ -682,7 +955,22 @@ impl<'a, T: ArgType<'a, Output = T>> ArgType<'a> for Rest<T> {
         Ok((
             Rest(ok!(args
                 .iter()
-                .map(|v| T::from_value(Some(v)))
+                .map(|v| T::from_state_and_value(state, Some(v)).map(|x| x.0))
+                .collect::<Result<_, _>>())),
+            args.len(),
+        ))
+    }
+
+    fn from_state_and_values_mut(
+        state: Option<&State>,
+        values: &'a [Value],
+        offset: usize,
+    ) -> Result<(Self, usize), Error> {
+        let args = values.get(offset..).unwrap_or_default();
+        Ok((
+            Rest(ok!(args
+                .iter()
+                .map(|v| T::from_state_and_value_mut(state, Some(v)).map(|x| x.0))
                 .collect::<Result<_, _>>())),
             args.len(),
         ))
@@ -736,9 +1024,10 @@ impl<'a, T: ArgType<'a, Output = T>> ArgType<'a> for Rest<T> {
 /// positional arguments and keyword arguments:
 ///
 /// ```
-/// # use minijinja::value::{Value, Rest, Kwargs, from_args};
+/// # use minijinja::value::{Value, ValueOrKwargs, Rest, Kwargs, from_args};
 /// # use minijinja::Error;
-/// fn my_func(args: Rest<Value>) -> Result<Value, Error> {
+/// fn my_func(args: Rest<ValueOrKwargs>) -> Result<Value, Error> {
+///     let args = args.into_values();
 ///     let (args, kwargs) = from_args::<(&[Value], Kwargs)>(&args)?;
 ///     // do something with args and kwargs
 /// # todo!()
@@ -762,20 +1051,17 @@ impl Deref for KwargsValues {
     }
 }
 
-impl KwargsValues {
-    fn as_value_map<'a>(self: &'a Arc<Self>) -> &'a Arc<ValueMap> {
-        // SAFETY: this is safe because of repr(transparent)
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
 impl Object for KwargsValues {
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
-        self.as_value_map().get_value(key)
+        self.0.get(key).cloned()
     }
 
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        self.as_value_map().enumerate()
+        self.mapped_enumerator(|this| Box::new(this.0.keys().cloned()))
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.0.len())
     }
 }
 
@@ -793,6 +1079,14 @@ impl<'a> ArgType<'a> for Kwargs {
 
     fn from_state_and_values(
         _state: Option<&'a State>,
+        values: &'a [Value],
+        offset: usize,
+    ) -> Result<(Self, usize), Error> {
+        Self::from_state_and_values_mut(None, values, offset)
+    }
+
+    fn from_state_and_values_mut(
+        _state: Option<&State>,
         values: &'a [Value],
         offset: usize,
     ) -> Result<(Self, usize), Error> {
@@ -818,6 +1112,13 @@ impl Kwargs {
         }
     }
 
+    pub(crate) fn is_kwargs(value: &Value) -> bool {
+        value
+            .as_object()
+            .and_then(|x| x.downcast_ref::<KwargsValues>())
+            .is_some()
+    }
+
     /// Given a value, extracts the kwargs if there are any.
     pub(crate) fn extract(value: &Value) -> Option<Kwargs> {
         value
@@ -838,7 +1139,7 @@ impl Kwargs {
     {
         T::from_value(self.values.get(&Value::from(key))).map_err(|mut err| {
             if err.kind() == ErrorKind::MissingArgument && err.detail().is_none() {
-                err.set_detail(format!("missing keyword argument '{}'", key));
+                err.set_detail(format!("missing keyword argument '{key}'"));
             }
             err
         })
@@ -892,7 +1193,7 @@ impl Kwargs {
                 if !used.contains(key) {
                     return Err(Error::new(
                         ErrorKind::TooManyArguments,
-                        format!("unknown keyword argument '{}'", key),
+                        format!("unknown keyword argument '{key}'"),
                     ));
                 }
             } else {
@@ -939,7 +1240,7 @@ impl TryFrom<Value> for Kwargs {
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value.0 {
-            ValueRepr::Undefined => Ok(Kwargs::new(Default::default())),
+            ValueRepr::Undefined(_) => Ok(Kwargs::new(Default::default())),
             ValueRepr::Object(_) => {
                 Kwargs::extract(&value).ok_or_else(|| Error::from(ErrorKind::InvalidOperation))
             }
@@ -948,25 +1249,78 @@ impl TryFrom<Value> for Kwargs {
     }
 }
 
-impl<'a> ArgType<'a> for Value {
-    type Output = Self;
+fn unexpected_kwargs() -> Error {
+    Error::new(ErrorKind::TooManyArguments, "unexpected keyword arguments")
+}
 
-    fn from_state_and_value(
-        _state: Option<&'a State>,
-        value: Option<&'a Value>,
-    ) -> Result<(Self::Output, usize), Error> {
-        Ok((ok!(Self::from_value(value)), 1))
+/// An argument value that can explicitly capture keyword arguments.
+///
+/// Regular [`Value`] arguments reject the internal keyword-argument value so
+/// that misspelled or unsupported keyword arguments do not get accepted as a
+/// positional value. Use this wrapper with [`Rest`] when implementing a
+/// variadic function that needs to split positional and keyword arguments.
+#[derive(Clone, Debug)]
+pub struct ValueOrKwargs(Value);
+
+impl ValueOrKwargs {
+    /// Consumes the wrapper and returns the underlying value.
+    pub fn into_value(self) -> Value {
+        self.0
     }
+}
+
+impl Deref for ValueOrKwargs {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Value> for ValueOrKwargs {
+    fn from(value: Value) -> Self {
+        ValueOrKwargs(value)
+    }
+}
+
+impl From<ValueOrKwargs> for Value {
+    fn from(value: ValueOrKwargs) -> Self {
+        value.0
+    }
+}
+
+impl<'a> ArgType<'a> for ValueOrKwargs {
+    type Output = Self;
 
     fn from_value(value: Option<&'a Value>) -> Result<Self, Error> {
         match value {
-            Some(value) => Ok(value.clone()),
+            Some(value) => Ok(ValueOrKwargs(value.clone())),
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
     }
 
     fn from_value_owned(value: Value) -> Result<Self, Error> {
-        Ok(value)
+        Ok(ValueOrKwargs(value))
+    }
+}
+
+impl<'a> ArgType<'a> for Value {
+    type Output = Self;
+
+    fn from_value(value: Option<&'a Value>) -> Result<Self, Error> {
+        match value {
+            Some(value) if !value.is_kwargs() => Ok(value.clone()),
+            Some(_) => Err(unexpected_kwargs()),
+            None => Err(Error::from(ErrorKind::MissingArgument)),
+        }
+    }
+
+    fn from_value_owned(value: Value) -> Result<Self, Error> {
+        if value.is_kwargs() {
+            Err(unexpected_kwargs())
+        } else {
+            Ok(value)
+        }
     }
 }
 
@@ -975,48 +1329,102 @@ impl<'a> ArgType<'a> for String {
 
     fn from_value(value: Option<&'a Value>) -> Result<Self, Error> {
         match value {
-            Some(value) => Ok(value.to_string()),
+            Some(value) => {
+                if value.is_kwargs() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "cannot convert kwargs to string",
+                    ));
+                }
+                Ok(value.to_string())
+            }
             None => Err(Error::from(ErrorKind::MissingArgument)),
         }
     }
 
-    fn from_value_owned(value: Value) -> Result<Self, Error> {
-        Ok(value.to_string())
+    fn from_state_and_value(
+        state: Option<&'a State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        Self::from_state_and_value_mut(state, value)
     }
+
+    fn from_state_and_value_mut(
+        state: Option<&State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        if let (Some(state), Some(value)) = (state, value) {
+            ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        }
+        Ok((ok!(Self::from_value(value)), 1))
+    }
+
+    fn from_state_and_value_owned(
+        state: Option<&'a State>,
+        value: Value,
+    ) -> Result<Self::Output, Error> {
+        Self::from_state_and_value_owned_mut(state, value)
+    }
+
+    fn from_state_and_value_owned_mut(
+        state: Option<&State>,
+        value: Value,
+    ) -> Result<Self::Output, Error> {
+        if let Some(state) = state {
+            ok!(state
+                .undefined_behavior()
+                .assert_value_not_undefined(&value));
+        }
+        Self::from_value_owned(value)
+    }
+
+    fn from_value_owned(value: Value) -> Result<Self, Error> {
+        value_to_string_cow(&value).map(Cow::into_owned)
+    }
+}
+
+fn convert_vec<T>(
+    value: Option<&Value>,
+    convert: impl FnMut(Value) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    value
+        .as_object()
+        .filter(|object| matches!(object.repr(), ObjectRepr::Seq | ObjectRepr::Iterable))
+        .and_then(|object| object.try_iter())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "not iterable"))?
+        .map(convert)
+        .collect()
 }
 
 impl<'a, T: ArgType<'a, Output = T>> ArgType<'a> for Vec<T> {
     type Output = Vec<T>;
 
     fn from_value(value: Option<&'a Value>) -> Result<Self, Error> {
-        match value {
-            None => Ok(Vec::new()),
-            Some(value) => {
-                let iter = ok!(value
-                    .as_object()
-                    .filter(|x| matches!(x.repr(), ObjectRepr::Seq | ObjectRepr::Iterable))
-                    .and_then(|x| x.try_iter())
-                    .ok_or_else(|| { Error::new(ErrorKind::InvalidOperation, "not iterable") }));
-                let mut rv = Vec::new();
-                for value in iter {
-                    rv.push(ok!(T::from_value_owned(value)));
-                }
-                Ok(rv)
-            }
-        }
+        convert_vec(value, T::from_value_owned)
+    }
+
+    fn from_state_and_value(
+        state: Option<&'a State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        convert_vec(value, |value| T::from_state_and_value_owned(state, value)).map(|rv| (rv, 1))
+    }
+
+    fn from_state_and_value_mut(
+        state: Option<&State>,
+        value: Option<&'a Value>,
+    ) -> Result<(Self::Output, usize), Error> {
+        convert_vec(value, |value| {
+            T::from_state_and_value_owned_mut(state, value)
+        })
+        .map(|rv| (rv, 1))
     }
 
     fn from_value_owned(value: Value) -> Result<Self, Error> {
-        let iter = ok!(value
-            .as_object()
-            .filter(|x| matches!(x.repr(), ObjectRepr::Seq | ObjectRepr::Iterable))
-            .and_then(|x| x.try_iter())
-            .ok_or_else(|| { Error::new(ErrorKind::InvalidOperation, "not iterable") }));
-        let mut rv = Vec::new();
-        for value in iter {
-            rv.push(ok!(T::from_value_owned(value)));
-        }
-        Ok(rv)
+        convert_vec(Some(&value), T::from_value_owned)
     }
 }
 
@@ -1064,6 +1472,15 @@ impl<I: Into<Value>> From<Option<I>> for Value {
     }
 }
 
+impl<I> From<&Option<I>> for Value
+where
+    I: Clone + Into<Value>,
+{
+    fn from(value: &Option<I>) -> Self {
+        Value::from(value.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1509,50 @@ mod tests {
         assert_eq!(args, &[Value::from(42), Value::from(true)]);
         assert_eq!(kwargs.get::<Value>("foo").unwrap(), Value::from(1));
         assert_eq!(kwargs.get::<Value>("bar").unwrap(), Value::from(2));
+    }
+
+    #[test]
+    fn test_value_rejects_kwargs() {
+        let kwargs = Value::from(Kwargs::from_iter([("foo", Value::from(1))]));
+
+        assert_eq!(
+            from_args::<(Value,)>(std::slice::from_ref(&kwargs))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TooManyArguments
+        );
+        assert_eq!(
+            from_args::<(Rest<Value>,)>(std::slice::from_ref(&kwargs))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TooManyArguments
+        );
+
+        let (value,) = from_args::<(ValueOrKwargs,)>(&[kwargs]).unwrap();
+        assert!(value.is_kwargs());
+    }
+
+    #[test]
+    fn test_kwargs_fails_string_conversion() {
+        let kwargs = Kwargs::from_iter([("foo", Value::from(1)), ("bar", Value::from(2))]);
+        let args = [Value::from(kwargs)];
+
+        let result = from_args::<(String,)>(&args);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid operation: cannot convert kwargs to string"
+        );
+
+        let result = from_args::<(Cow<str>,)>(&args);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid operation: cannot convert kwargs to string"
+        );
+
+        let result = String::from_value_owned(args[0].clone());
+        assert!(result.is_err());
     }
 
     #[test]

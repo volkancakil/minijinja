@@ -43,13 +43,19 @@
 //! ```
 //!
 //! MiniJinja will perform the necessary conversions automatically.  For more
-//! information see the [`Filter`] trait.
+//! information see the [`Function`](crate::functions::Function) trait.
+//!
+//! Filters which transform strings and need to preserve the input's escaping
+//! safety can use [`StringInput`](crate::value::StringInput) as their argument
+//! type.  It retains the safety provenance that conversion to [`String`] would
+//! otherwise discard.
 //!
 //! # Accessing State
 //!
-//! In some cases it can be necessary to access the execution [`State`].  Since a borrowed
-//! state implements [`ArgType`] it's possible to add a parameter that holds the state.
-//! For instance the following filter appends the current template name to the string:
+//! In some cases it can be necessary to access the execution [`State`].  A filter
+//! can request shared or mutable state by taking `&State` or `&mut State` as its
+//! first parameter.  State is injected separately from the filter's value arguments.
+//! For instance, the following filter appends the current template name to the string:
 //!
 //! ```
 //! # use minijinja::Environment;
@@ -62,6 +68,10 @@
 //!
 //! env.add_filter("append_template", append_template);
 //! ```
+//!
+//! Filters which need to modify the state can instead take `&mut State`.  A
+//! mutable state must be the filter's first parameter and can only be requested
+//! once.
 //!
 //! # Filter configuration
 //!
@@ -112,144 +122,11 @@
 //!
 //! Some additional filters are available in the
 //! [`minijinja-contrib`](https://crates.io/crates/minijinja-contrib) crate.
-use std::sync::Arc;
-
 use crate::error::Error;
-use crate::utils::{write_escaped, SealedMarker};
-use crate::value::{ArgType, FunctionArgs, FunctionResult, Value};
+use crate::utils::write_escaped;
+use crate::value::Value;
 use crate::vm::State;
 use crate::{AutoEscape, Output};
-
-type FilterFunc = dyn Fn(&State, &[Value]) -> Result<Value, Error> + Sync + Send + 'static;
-
-#[derive(Clone)]
-pub(crate) struct BoxedFilter(Arc<FilterFunc>);
-
-/// A utility trait that represents filters.
-///
-/// This trait is used by the [`add_filter`](crate::Environment::add_filter) method to abstract over
-/// different types of functions that implement filters.  Filters are functions
-/// which at the very least accept the [`State`] by reference as first parameter
-/// and the value that that the filter is applied to as second.  Additionally up to
-/// 4 further parameters are supported.
-///
-/// A filter can return any of the following types:
-///
-/// * `Rv` where `Rv` implements `Into<Value>`
-/// * `Result<Rv, Error>` where `Rv` implements `Into<Value>`
-///
-/// Filters accept one mandatory parameter which is the value the filter is
-/// applied to and up to 4 extra parameters.  The extra parameters can be
-/// marked optional by using `Option<T>`.  The last argument can also use
-/// [`Rest<T>`](crate::value::Rest) to capture the remaining arguments.  All
-/// types are supported for which [`ArgType`] is implemented.
-///
-/// For a list of built-in filters see [`filters`](crate::filters).
-///
-/// # Basic Example
-///
-/// ```
-/// # use minijinja::Environment;
-/// # let mut env = Environment::new();
-/// use minijinja::State;
-///
-/// fn slugify(value: String) -> String {
-///     value.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-")
-/// }
-///
-/// env.add_filter("slugify", slugify);
-/// ```
-///
-/// ```jinja
-/// {{ "Foo Bar Baz"|slugify }} -> foo-bar-baz
-/// ```
-///
-/// # Arguments and Optional Arguments
-///
-/// ```
-/// # use minijinja::Environment;
-/// # let mut env = Environment::new();
-/// fn substr(value: String, start: u32, end: Option<u32>) -> String {
-///     let end = end.unwrap_or(value.len() as _);
-///     value.get(start as usize..end as usize).unwrap_or_default().into()
-/// }
-///
-/// env.add_filter("substr", substr);
-/// ```
-///
-/// ```jinja
-/// {{ "Foo Bar Baz"|substr(4) }} -> Bar Baz
-/// {{ "Foo Bar Baz"|substr(4, 7) }} -> Bar
-/// ```
-///
-/// # Variadic
-///
-/// ```
-/// # use minijinja::Environment;
-/// # let mut env = Environment::new();
-/// use minijinja::value::Rest;
-///
-/// fn pyjoin(joiner: String, values: Rest<String>) -> String {
-///     values.join(&joiner)
-/// }
-///
-/// env.add_filter("pyjoin", pyjoin);
-/// ```
-///
-/// ```jinja
-/// {{ "|".join(1, 2, 3) }} -> 1|2|3
-/// ```
-pub trait Filter<Rv, Args>: Send + Sync + 'static {
-    /// Applies a filter to value with the given arguments.
-    ///
-    /// The value is always the first argument.
-    #[doc(hidden)]
-    fn apply_to(&self, args: Args, _: SealedMarker) -> Rv;
-}
-
-macro_rules! tuple_impls {
-    ( $( $name:ident )* ) => {
-        impl<Func, Rv, $($name),*> Filter<Rv, ($($name,)*)> for Func
-        where
-            Func: Fn($($name),*) -> Rv + Send + Sync + 'static,
-            Rv: FunctionResult,
-            $($name: for<'a> ArgType<'a>,)*
-        {
-            fn apply_to(&self, args: ($($name,)*), _: SealedMarker) -> Rv {
-                #[allow(non_snake_case)]
-                let ($($name,)*) = args;
-                (self)($($name,)*)
-            }
-        }
-    };
-}
-
-tuple_impls! {}
-tuple_impls! { A }
-tuple_impls! { A B }
-tuple_impls! { A B C }
-tuple_impls! { A B C D }
-tuple_impls! { A B C D E }
-
-impl BoxedFilter {
-    /// Creates a new boxed filter.
-    pub fn new<F, Rv, Args>(f: F) -> BoxedFilter
-    where
-        F: Filter<Rv, Args> + for<'a> Filter<Rv, <Args as FunctionArgs<'a>>::Output>,
-        Rv: FunctionResult,
-        Args: for<'a> FunctionArgs<'a>,
-    {
-        BoxedFilter(Arc::new(move |state, args| -> Result<Value, Error> {
-            f.apply_to(ok!(Args::from_values(Some(state), args)), SealedMarker)
-                .into_result()
-        }))
-    }
-
-    /// Applies the filter to a value and argument.
-    pub fn apply_to(&self, state: &State, args: &[Value]) -> Result<Value, Error> {
-        (self.0)(state, args)
-    }
-}
 
 /// Marks a value as safe.  This converts it into a string.
 ///
@@ -264,9 +141,9 @@ pub fn safe(v: String) -> Value {
 /// this filter escapes with the format that is native to the format or HTML
 /// otherwise.  This means that if the auto escape setting is set to
 /// `Json` for instance then this filter will serialize to JSON instead.
-pub fn escape(state: &State, v: Value) -> Result<Value, Error> {
+pub fn escape(state: &mut State, v: &Value) -> Result<Value, Error> {
     if v.is_safe() {
-        return Ok(v);
+        return Ok(v.clone());
     }
 
     // this tries to use the escaping flag of the current scope, then
@@ -283,8 +160,19 @@ pub fn escape(state: &State, v: Value) -> Result<Value, Error> {
         Some(s) => String::with_capacity(s.len()),
         None => String::new(),
     };
-    let mut out = Output::with_string(&mut rv);
-    ok!(write_escaped(&mut out, auto_escape, &v));
+    let mut out = Output::new(&mut rv);
+    if matches!(auto_escape, AutoEscape::Custom(_)) {
+        // The formatter reads the escape mode from state, so temporarily
+        // override it to ensure |e honors the computed escape mode even when
+        // auto-escape is disabled in the current scope. The default formatter
+        // also errors on custom auto-escape formats, so we must route through
+        // the environment formatter here.
+        ok!(state.with_auto_escape(auto_escape, |state| {
+            state.env().format(v, state, &mut out)
+        }));
+    } else {
+        ok!(write_escaped(&mut out, auto_escape, v));
+    }
     Ok(Value::from_safe_string(rv))
 }
 
@@ -293,13 +181,21 @@ mod builtins {
     use super::*;
 
     use crate::error::ErrorKind;
-    use crate::utils::splitn_whitespace;
-    use crate::value::ops::as_f64;
-    use crate::value::{Kwargs, ValueKind, ValueRepr};
+    use crate::formatting::{
+        format as format_string, format_printf_with, FormatConversion, FormatStyle,
+    };
+    use crate::utils::{safe_sort, splitn_whitespace};
+    use crate::value::merge_object::{MergeDict, MergeSeq};
+    use crate::value::ops::{self, as_f64, LenIterWrap};
+    use crate::value::{
+        Enumerator, Kwargs, Object, ObjectRepr, Rest, StringInput, Tuple, ValueKind, ValueOrKwargs,
+        ValueRepr,
+    };
     use std::borrow::Cow;
     use std::cmp::Ordering;
     use std::fmt::Write;
     use std::mem;
+    use std::sync::Arc;
 
     /// Converts a value to uppercase.
     ///
@@ -307,8 +203,9 @@ mod builtins {
     /// <h1>{{ chapter.title|upper }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn upper(v: Cow<'_, str>) -> String {
-        v.to_uppercase()
+    pub fn upper(value: StringInput<'_>) -> Value {
+        let output = value.as_str().to_uppercase();
+        value.preserve_safety(output)
     }
 
     /// Converts a value to lowercase.
@@ -317,11 +214,16 @@ mod builtins {
     /// <h1>{{ chapter.title|lower }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn lower(v: Cow<'_, str>) -> String {
-        v.to_lowercase()
+    pub fn lower(value: StringInput<'_>) -> Value {
+        let output = value.as_str().to_lowercase();
+        value.preserve_safety(output)
     }
 
     /// Converts a value to title case.
+    ///
+    /// Words are started by whitespace or one of `-`, `(`, `{`, `[` and `<`.
+    /// Other punctuation such as `'`, `.` or `_` does not start a new word,
+    /// so `don't` becomes `Don't` rather than `Don'T`.
     ///
     /// ```jinja
     /// <h1>{{ chapter.title|title }}</h1>
@@ -331,7 +233,7 @@ mod builtins {
         let mut rv = String::new();
         let mut capitalize = true;
         for c in v.chars() {
-            if c.is_ascii_punctuation() || c.is_whitespace() {
+            if matches!(c, '-' | '(' | '{' | '[' | '<') || c.is_whitespace() {
                 rv.push(c);
                 capitalize = true;
             } else if capitalize {
@@ -351,12 +253,15 @@ mod builtins {
     /// <h1>{{ chapter.title|capitalize }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn capitalize(text: Cow<'_, str>) -> String {
-        let mut chars = text.chars();
-        match chars.next() {
+    pub fn capitalize(value: StringInput<'_>) -> Value {
+        let mut chars = value.as_str().chars();
+        let output = match chars.next() {
             None => String::new(),
-            Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-        }
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+        };
+        value.preserve_safety(output)
     }
 
     /// Does a string replace.
@@ -369,12 +274,24 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn replace(
-        _state: &State,
-        v: Cow<'_, str>,
-        from: Cow<'_, str>,
-        to: Cow<'_, str>,
-    ) -> String {
-        v.replace(&from as &str, &to as &str)
+        state: &mut State,
+        value: StringInput<'_>,
+        from: StringInput<'_>,
+        to: StringInput<'_>,
+    ) -> Result<Value, Error> {
+        let safety_aware = !matches!(state.auto_escape(), AutoEscape::None)
+            && (value.is_safe() || from.is_safe() || to.is_safe());
+
+        if safety_aware {
+            let output = value
+                .format(state)?
+                .replace(from.as_str(), &to.format(state)?);
+            Ok(Value::from_safe_string(output))
+        } else {
+            Ok(Value::from(
+                value.as_str().replace(from.as_str(), to.as_str()),
+            ))
+        }
     }
 
     /// Returns the "length" of the value
@@ -385,7 +302,7 @@ mod builtins {
     /// <p>Search results: {{ results|length }}
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn length(v: Value) -> Result<usize, Error> {
+    pub fn length(v: &Value) -> Result<usize, Error> {
         v.len().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidOperation,
@@ -394,20 +311,29 @@ mod builtins {
         })
     }
 
-    fn sort_helper(a: &Value, b: &Value, case_sensitive: bool) -> Ordering {
-        if !case_sensitive {
+    fn cmp_helper(a: &Value, b: &Value, case_sensitive: bool, reverse: bool) -> Ordering {
+        let ordering = if !case_sensitive {
             if let (Some(a), Some(b)) = (a.as_str(), b.as_str()) {
                 #[cfg(feature = "unicode")]
                 {
-                    return unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b));
+                    unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b))
                 }
                 #[cfg(not(feature = "unicode"))]
                 {
-                    return a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
                 }
+            } else {
+                a.cmp(b)
             }
+        } else {
+            a.cmp(b)
+        };
+
+        if reverse {
+            ordering.reverse()
+        } else {
+            ordering
         }
-        a.cmp(b)
     }
 
     /// Dict sorting functionality.
@@ -420,47 +346,33 @@ mod builtins {
     /// * `by`: set to `"value"` to sort by value. Defaults to `"key"`.
     /// * `reverse`: set to `true` to sort in reverse.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn dictsort(v: Value, kwargs: Kwargs) -> Result<Value, Error> {
-        if v.kind() == ValueKind::Map {
-            let mut rv = Vec::with_capacity(v.len().unwrap_or(0));
-            let iter = ok!(v.try_iter());
-            for key in iter {
-                let value = v.get_item(&key).unwrap_or(Value::UNDEFINED);
-                rv.push((key, value));
-            }
-            let by_value = match ok!(kwargs.get("by")) {
-                None | Some("key") => false,
-                Some("value") => true,
-                Some(invalid) => {
-                    return Err(Error::new(
-                        ErrorKind::InvalidOperation,
-                        format!("invalid value '{}' for 'by' parameter", invalid),
-                    ))
-                }
-            };
-            let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
-            rv.sort_by(|a, b| {
-                let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
-                sort_helper(a, b, case_sensitive)
-            });
-            if let Some(true) = ok!(kwargs.get("reverse")) {
-                rv.reverse();
-            }
-            ok!(kwargs.assert_all_used());
-            Ok(Value::from(
-                rv.into_iter()
-                    .map(|(k, v)| Value::from(vec![k, v]))
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            Err(Error::new(
+    pub fn dictsort(v: &Value, kwargs: Kwargs) -> Result<Value, Error> {
+        if v.kind() != ValueKind::Map {
+            return Err(Error::new(
                 ErrorKind::InvalidOperation,
                 "cannot convert value into pair list",
-            ))
+            ));
         }
+
+        let by_value = matches!(ok!(kwargs.get("by")), Some("value"));
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
+        let mut rv: Vec<_> = if let Some(iter) = v.as_object().and_then(|v| v.try_iter_pairs()) {
+            iter.collect()
+        } else {
+            ok!(v.try_iter())
+                .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
+                .collect()
+        };
+        safe_sort(&mut rv, |a, b| {
+            let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
+            cmp_helper(a, b, case_sensitive, reverse)
+        })?;
+        kwargs.assert_all_used()?;
+        Ok(rv.into_iter().map(Value::from).collect())
     }
 
-    /// Returns a list of pairs (items) from a mapping.
+    /// Returns an iterable of pairs (items) from a mapping.
     ///
     /// This can be used to iterate over keys and values of a mapping
     /// at once.  Note that this will use the original order of the map
@@ -478,19 +390,26 @@ mod builtins {
     /// </dl>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn items(v: Value) -> Result<Value, Error> {
+    pub fn items(v: &Value) -> Result<Value, Error> {
         if v.kind() == ValueKind::Map {
-            let mut rv = Vec::with_capacity(v.len().unwrap_or(0));
-            let iter = ok!(v.try_iter());
-            for key in iter {
-                let value = v.get_item(&key).unwrap_or(Value::UNDEFINED);
-                rv.push(Value::from(vec![key, value]));
-            }
-            Ok(Value::from(rv))
+            Ok(Value::make_object_iterable(v.clone(), |v| {
+                match v.as_object().and_then(|v| v.try_iter_pairs()) {
+                    Some(iter) => Box::new(iter.map(Value::from)),
+                    None => Box::new(
+                        // this really should not happen unless the object changes it's shape
+                        // after the initial check
+                        Some(Value::from(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("{} is not iterable", v.kind()),
+                        )))
+                        .into_iter(),
+                    ),
+                }
+            }))
         } else {
             Err(Error::new(
                 ErrorKind::InvalidOperation,
-                "cannot convert value into pair list",
+                "cannot convert value into pairs",
             ))
         }
     }
@@ -503,58 +422,125 @@ mod builtins {
     /// {% endfor %}
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn reverse(v: Value) -> Result<Value, Error> {
-        v.reverse()
+    pub fn reverse(value: &Value) -> Result<Value, Error> {
+        if value.kind() == ValueKind::String {
+            let string = value.as_str().unwrap();
+            let output = string.chars().rev().collect::<String>();
+            if value.is_safe() {
+                Ok(Value::from_safe_string(output))
+            } else {
+                Ok(Value::from(output))
+            }
+        } else {
+            value.reverse()
+        }
     }
 
-    /// Trims a value
+    /// Trims a string.
+    ///
+    /// By default, it trims leading and trailing whitespaces:
+    ///
+    /// ```jinja
+    /// {{ "  non-space characters  " | trim }} -> "non-space characters"
+    /// ```
+    ///
+    /// You can also remove a character sequence.  All the prefixes and suffixes
+    /// matching the sequence are removed:
+    ///
+    /// ```jinja
+    /// {{ "1212foo12bar1212" | trim("12") }} -> "foo12bar"
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn trim(s: Cow<'_, str>, chars: Option<Cow<'_, str>>) -> String {
-        match chars {
+    pub fn trim(value: StringInput<'_>, chars: Option<Cow<'_, str>>) -> Value {
+        let output = match chars {
             Some(chars) => {
                 let chars = chars.chars().collect::<Vec<_>>();
-                s.trim_matches(&chars[..]).to_string()
+                value.as_str().trim_matches(&chars[..]).to_string()
             }
-            None => s.trim().to_string(),
-        }
+            None => value.as_str().trim().to_string(),
+        };
+        value.preserve_safety(output)
     }
 
     /// Joins a sequence by a character
+    ///
+    /// ```jinja
+    /// {{ "Foo Bar Baz" | join(", ") }} -> foo, bar, baz
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn join(val: Value, joiner: Option<Cow<'_, str>>) -> Result<String, Error> {
-        if val.is_undefined() || val.is_none() {
-            return Ok(String::new());
+    pub fn join(
+        state: &mut State,
+        value: &Value,
+        joiner: Option<StringInput<'_>>,
+    ) -> Result<Value, Error> {
+        fn join_plain(iter: impl Iterator<Item = Value>, joiner: &str) -> String {
+            let mut output = String::new();
+            for (idx, item) in iter.enumerate() {
+                if idx > 0 {
+                    output.push_str(joiner);
+                }
+                if let Some(string) = item.as_str() {
+                    output.push_str(string);
+                } else {
+                    write!(output, "{item}").ok();
+                }
+            }
+            output
         }
 
-        let joiner = joiner.as_ref().unwrap_or(&Cow::Borrowed(""));
-
-        if let Some(s) = val.as_str() {
-            let mut rv = String::new();
-            for c in s.chars() {
-                if !rv.is_empty() {
-                    rv.push_str(joiner);
+        fn join_safe(
+            state: &mut State,
+            iter: impl Iterator<Item = Value>,
+            joiner: &str,
+        ) -> Result<String, Error> {
+            let mut output = String::new();
+            for (idx, item) in iter.enumerate() {
+                if idx > 0 {
+                    output.push_str(joiner);
                 }
-                rv.push(c);
-            }
-            Ok(rv)
-        } else if let Some(iter) = val.as_object().and_then(|x| x.try_iter()) {
-            let mut rv = String::new();
-            for item in iter {
-                if !rv.is_empty() {
-                    rv.push_str(joiner);
-                }
-                if let Some(s) = item.as_str() {
-                    rv.push_str(s);
+                if item.is_safe() {
+                    output.push_str(item.as_str().unwrap());
                 } else {
-                    write!(rv, "{item}").ok();
+                    output.push_str(&ok!(state.format(item)));
                 }
             }
-            Ok(rv)
-        } else {
-            Err(Error::new(
+            Ok(output)
+        }
+
+        let joiner_str = joiner.as_ref().map(StringInput::as_str).unwrap_or_default();
+        let iter = ok!(value.try_iter().map_err(|err| {
+            Error::new(
                 ErrorKind::InvalidOperation,
-                format!("cannot join value of type {}", val.kind()),
-            ))
+                format!("cannot join value of type {}", value.kind()),
+            )
+            .with_source(err)
+        }));
+
+        if matches!(state.auto_escape(), AutoEscape::None) {
+            return Ok(Value::from(join_plain(iter, joiner_str)));
+        }
+
+        if joiner.as_ref().is_some_and(StringInput::is_safe) {
+            return Ok(Value::from_safe_string(ok!(join_safe(
+                state, iter, joiner_str
+            ))));
+        }
+
+        // A plain joiner only becomes safe if at least one item is safe.  This
+        // is the one case where the iterable must be inspected before output.
+        let items = iter.collect::<Vec<_>>();
+        if items.iter().any(Value::is_safe) {
+            let joiner = match joiner.as_ref() {
+                Some(joiner) => ok!(joiner.format(state)),
+                None => Cow::Borrowed(""),
+            };
+            Ok(Value::from_safe_string(ok!(join_safe(
+                state,
+                items.into_iter(),
+                &joiner
+            ))))
+        } else {
+            Ok(Value::from(join_plain(items.into_iter(), joiner_str)))
         }
     }
 
@@ -569,22 +555,59 @@ mod builtins {
     /// rather than Rust ones so `1` means one split and two resulting items.
     ///
     /// ```jinja
-    /// {{ "hello world"|split|list }}
+    /// {{ "hello world"|split }}
     ///     -> ["hello", "world"]
     ///
-    /// {{ "c,s,v"|split(",")|list }}
+    /// {{ "c,s,v"|split(",") }}
     ///     -> ["c", "s", "v"]
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn split(s: Arc<str>, split: Option<Arc<str>>, maxsplits: Option<i64>) -> Value {
+    pub fn split(
+        value: &Value,
+        split: Option<Arc<str>>,
+        maxsplits: Option<i64>,
+    ) -> Result<Value, Error> {
+        let string = Arc::<str>::try_from(value.clone())?;
         let maxsplits = maxsplits.and_then(|x| if x >= 0 { Some(x as usize + 1) } else { None });
+        let preserve_safety = value.kind() == ValueKind::String && value.is_safe();
+        let wrap = |item: &str| {
+            if preserve_safety {
+                Value::from_safe_string(item.to_string())
+            } else {
+                Value::from(item)
+            }
+        };
 
-        Value::make_object_iterable((s, split), move |(s, split)| match (split, maxsplits) {
-            (None, None) => Box::new(s.split_whitespace().map(Value::from)),
-            (Some(split), None) => Box::new(s.split(split as &str).map(Value::from)),
-            (None, Some(n)) => Box::new(splitn_whitespace(s, n).map(Value::from)),
-            (Some(split), Some(n)) => Box::new(s.splitn(n, split as &str).map(Value::from)),
+        // Materialize into a sequence (like `lines`) so negative indexing and
+        // slicing work, e.g. `("1.2.3"|split("."))[-1]`.
+        Ok(match (split, maxsplits) {
+            (None, None) => Value::from_iter(string.split_whitespace().map(wrap)),
+            (Some(sep), None) => Value::from_iter(string.split(sep.as_ref()).map(wrap)),
+            (None, Some(n)) => Value::from_iter(splitn_whitespace(&string, n).map(wrap)),
+            (Some(sep), Some(n)) => Value::from_iter(string.splitn(n, sep.as_ref()).map(wrap)),
         })
+    }
+
+    /// Splits a string into lines.
+    ///
+    /// The newline character is removed in the process and not retained.  This
+    /// function supports both Windows and UNIX style newlines.
+    ///
+    /// ```jinja
+    /// {{ "foo\nbar\nbaz"|lines }}
+    ///     -> ["foo", "bar", "baz"]
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn lines(value: &Value) -> Result<Value, Error> {
+        let string = Arc::<str>::try_from(value.clone())?;
+        let preserve_safety = value.kind() == ValueKind::String && value.is_safe();
+        Ok(Value::from_iter(string.lines().map(|line| {
+            if preserve_safety {
+                Value::from_safe_string(line.to_string())
+            } else {
+                Value::from(line)
+            }
+        })))
     }
 
     /// If the value is undefined it will return the passed default value,
@@ -593,12 +616,30 @@ mod builtins {
     /// ```jinja
     /// <p>{{ my_variable|default("my_variable was not defined") }}</p>
     /// ```
+    ///
+    /// Setting the optional second parameter to `true` will also treat falsy
+    /// values as undefined, e.g. empty strings:
+    ///
+    /// ```jinja
+    /// <p>{{ ""|default("string was empty", true) }}</p>
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn default(value: Value, other: Option<Value>) -> Value {
-        if value.is_undefined() {
-            other.unwrap_or_else(|| Value::from(""))
+    pub fn default(state: &State, value: &Value, args: Rest<Value>) -> Result<Value, Error> {
+        if args.len() > 2 {
+            return Err(Error::from(ErrorKind::TooManyArguments));
+        }
+
+        let other = args.first().cloned().unwrap_or_else(|| Value::from(""));
+        let lax = if let Some(lax) = args.get(1) {
+            ok!(state.undefined_behavior().is_true(lax))
         } else {
-            value
+            false
+        };
+
+        if value.is_undefined() || (lax && !value.is_true()) {
+            Ok(other)
+        } else {
+            Ok(value.clone())
         }
     }
 
@@ -635,12 +676,15 @@ mod builtins {
     /// {{ "42"|int == 42 }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn int(value: Value) -> Result<Value, Error> {
+    pub fn int(state: &State, value: &Value) -> Result<Value, Error> {
         match &value.0 {
-            ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(0)),
+            ValueRepr::Undefined(_) | ValueRepr::None => {
+                ok!(state.undefined_behavior().assert_value_not_undefined(value));
+                Ok(Value::from(0))
+            }
             ValueRepr::Bool(x) => Ok(Value::from(*x as u64)),
             ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::U128(_) | ValueRepr::I128(_) => {
-                Ok(value)
+                Ok(value.clone())
             }
             ValueRepr::F64(v) => Ok(Value::from(*v as i128)),
             ValueRepr::String(..) | ValueRepr::SmallStr(_) => {
@@ -658,7 +702,7 @@ mod builtins {
                 ErrorKind::InvalidOperation,
                 format!("cannot convert {} to integer", value.kind()),
             )),
-            ValueRepr::Invalid(_) => value.validate(),
+            ValueRepr::Invalid(_) => value.clone().validate(),
         }
     }
 
@@ -668,9 +712,12 @@ mod builtins {
     /// {{ "42.5"|float == 42.5 }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn float(value: Value) -> Result<Value, Error> {
+    pub fn float(state: &State, value: &Value) -> Result<Value, Error> {
         match &value.0 {
-            ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(0.0)),
+            ValueRepr::Undefined(_) | ValueRepr::None => {
+                ok!(state.undefined_behavior().assert_value_not_undefined(value));
+                Ok(Value::from(0.0))
+            }
             ValueRepr::Bool(x) => Ok(Value::from(*x as u64 as f64)),
             ValueRepr::String(..) | ValueRepr::SmallStr(_) => value
                 .as_str()
@@ -678,14 +725,39 @@ mod builtins {
                 .parse::<f64>()
                 .map(Value::from)
                 .map_err(|err| Error::new(ErrorKind::InvalidOperation, err.to_string())),
-            ValueRepr::Invalid(_) => value.validate(),
-            _ => as_f64(&value).map(Value::from).ok_or_else(|| {
+            ValueRepr::Invalid(_) => value.clone().validate(),
+            _ => as_f64(value, true).map(Value::from).ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidOperation,
                     format!("cannot convert {} to float", value.kind()),
                 )
             }),
         }
+    }
+
+    /// Sums up all the values in a sequence.
+    ///
+    /// ```jinja
+    /// {{ range(10)|sum }} -> 45
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn sum(state: &State, values: Value) -> Result<Value, Error> {
+        let mut rv = Value::from(0);
+        let iter = ok!(state.undefined_behavior().try_iter(values));
+        for value in iter {
+            if value.is_undefined() {
+                ok!(state.undefined_behavior().handle_undefined(false));
+                continue;
+            } else if !value.is_number() {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("can only sum numbers, got {}", value.kind()),
+                ));
+            }
+            rv = ok!(ops::add(&rv, &value));
+        }
+
+        Ok(rv)
     }
 
     /// Looks up an attribute.
@@ -698,7 +770,7 @@ mod builtins {
     /// {{ value['key'] == value|attr('key') }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn attr(value: Value, key: &Value) -> Result<Value, Error> {
+    pub fn attr(value: &Value, key: &Value) -> Result<Value, Error> {
         value.get_item(key)
     }
 
@@ -739,7 +811,7 @@ mod builtins {
     /// </dl>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn first(value: Value) -> Result<Value, Error> {
+    pub fn first(value: &Value) -> Result<Value, Error> {
         if let Some(s) = value.as_str() {
             Ok(s.chars().next().map_or(Value::UNDEFINED, Value::from))
         } else if let Some(mut iter) = value.as_object().and_then(|x| x.try_iter()) {
@@ -769,8 +841,14 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn last(value: Value) -> Result<Value, Error> {
-        if let Some(s) = value.as_str() {
-            Ok(s.chars().next_back().map_or(Value::UNDEFINED, Value::from))
+        if let Some(string) = value.as_str() {
+            Ok(string.chars().next_back().map_or(Value::UNDEFINED, |ch| {
+                if value.is_safe() {
+                    Value::from_safe_string(ch.to_string())
+                } else {
+                    Value::from(ch)
+                }
+            }))
         } else if matches!(value.kind(), ValueKind::Seq | ValueKind::Iterable) {
             let rev = ok!(value.reverse());
             let mut iter = ok!(rev.try_iter());
@@ -814,7 +892,8 @@ mod builtins {
     /// The filter accepts a few keyword arguments:
     ///
     /// * `case_sensitive`: set to `true` to make the sorting of strings case sensitive.
-    /// * `attribute`: can be set to an attribute or dotted path to sort by that attribute
+    /// * `attribute`: can be set to an attribute or dotted path to sort by that attribute.
+    ///   can be a comma-separated list of attributes forming a composite key like "age, name".
     /// * `reverse`: set to `true` to sort in reverse.
     ///
     /// ```jinja
@@ -824,6 +903,8 @@ mod builtins {
     /// {{ users|sort(attribute="age") }}
     /// # Sort users by age attribute in ascending order.
     /// {{ users|sort(attribute="age", reverse=true) }}
+    /// # Sort cities by their name, and sort those with the same name by their state.
+    /// {{ cities|sort(attribute="name, state") }}
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn sort(state: &State, value: Value, kwargs: Kwargs) -> Result<Value, Error> {
@@ -831,17 +912,48 @@ mod builtins {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }))
         .collect::<Vec<_>>();
+
         let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
+
         if let Some(attr) = ok!(kwargs.get::<Option<&str>>("attribute")) {
-            items.sort_by(|a, b| match (a.get_path(attr), b.get_path(attr)) {
-                (Ok(a), Ok(b)) => sort_helper(&a, &b, case_sensitive),
-                _ => Ordering::Equal,
-            });
+            let keys: Vec<_> = attr
+                .split(',')
+                .filter_map(|key| {
+                    let trimmed = key.trim();
+                    if !key.is_empty() {
+                        Some(trimmed)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if keys.len() > 1 {
+                // More than one keys
+                safe_sort(&mut items, |a, b| {
+                    let key_a = Value::from_iter(
+                        keys.iter()
+                            .map(|k| a.get_path_or_default(k, &Value::UNDEFINED)),
+                    );
+                    let key_b = Value::from_iter(
+                        keys.iter()
+                            .map(|k| b.get_path_or_default(k, &Value::UNDEFINED)),
+                    );
+                    cmp_helper(&key_a, &key_b, case_sensitive, reverse)
+                })?;
+            } else {
+                // Fast path for a more common case of single key
+                let key = if !keys.is_empty() { keys[0] } else { attr };
+                safe_sort(&mut items, |a, b| {
+                    match (a.get_path(key), b.get_path(key)) {
+                        (Ok(a), Ok(b)) => cmp_helper(&a, &b, case_sensitive, reverse),
+                        _ => Ordering::Equal,
+                    }
+                })?;
+            }
         } else {
-            items.sort_by(|a, b| sort_helper(a, b, case_sensitive))
-        }
-        if let Some(true) = ok!(kwargs.get("reverse")) {
-            items.reverse();
+            safe_sort(&mut items, |a, b| cmp_helper(a, b, case_sensitive, reverse))?;
         }
         ok!(kwargs.assert_all_used());
         Ok(Value::from(items))
@@ -861,6 +973,19 @@ mod builtins {
         Ok(Value::from(iter.collect::<Vec<_>>()))
     }
 
+    /// Converts a value into a string if it's not one already.
+    ///
+    /// If the string has been marked as safe, that value is preserved.
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn string(state: &State, value: &Value) -> Result<Value, Error> {
+        ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        Ok(if value.kind() == ValueKind::String {
+            value.clone()
+        } else {
+            value.to_string().into()
+        })
+    }
+
     /// Converts the value into a boolean value.
     ///
     /// This behaves the same as the if statement does with regards to
@@ -870,8 +995,8 @@ mod builtins {
     /// {{ 42|bool }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn bool(value: Value) -> bool {
-        value.is_true()
+    pub fn bool(state: &State, value: &Value) -> Result<bool, Error> {
+        state.undefined_behavior().is_true(value)
     }
 
     /// Slice an iterable and return a list of lists containing
@@ -986,12 +1111,58 @@ mod builtins {
         Ok(Value::from(rv))
     }
 
+    #[cfg(feature = "json")]
+    struct JinjaJsonFormatter;
+
+    #[cfg(feature = "json")]
+    impl serde_json::ser::Formatter for JinjaJsonFormatter {
+        fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+        where
+            W: ?Sized + std::io::Write,
+        {
+            writer.write_all(b": ")
+        }
+    }
+
+    #[cfg(feature = "json")]
+    fn serialize_json<F>(value: &Value, formatter: F) -> serde_json::Result<String>
+    where
+        F: serde_json::ser::Formatter,
+    {
+        let mut output = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
+        serde::Serialize::serialize(value, &mut serializer)?;
+        Ok(String::from_utf8(output).expect("JSON serializer emitted invalid UTF-8"))
+    }
+
     /// Dumps a value to JSON.
     ///
     /// This filter is only available if the `json` feature is enabled.  The resulting
     /// value is safe to use in HTML as well as it will not contain any special HTML
     /// characters.  The optional parameter to the filter can be set to `true` to enable
-    /// pretty printing.  Not that the `"` character is left unchanged as it's the
+    /// pretty printing.  Note that the `"` character is left unchanged as it's the
     /// JSON string delimiter.  If you want to pass JSON serialized this way into an
     /// HTTP attribute use single quoted HTML attributes:
     ///
@@ -1014,7 +1185,7 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins", feature = "json"))))]
     #[cfg(feature = "json")]
-    pub fn tojson(value: Value, indent: Option<Value>, args: Kwargs) -> Result<Value, Error> {
+    pub fn tojson(value: &Value, indent: Option<Value>, args: Kwargs) -> Result<Value, Error> {
         let indent = match indent {
             Some(indent) => Some(indent),
             None => ok!(args.get("indent")),
@@ -1027,16 +1198,15 @@ mod builtins {
                 None => Some(ok!(usize::try_from(val.clone()))),
             },
         };
-        args.assert_all_used()?;
+        ok!(args.assert_all_used());
         if let Some(indent) = indent {
-            let mut out = Vec::<u8>::new();
             let indentation = " ".repeat(indent);
-            let formatter = serde_json::ser::PrettyFormatter::with_indent(indentation.as_bytes());
-            let mut s = serde_json::Serializer::with_formatter(&mut out, formatter);
-            serde::Serialize::serialize(&value, &mut s)
-                .map(|_| unsafe { String::from_utf8_unchecked(out) })
+            serialize_json(
+                value,
+                serde_json::ser::PrettyFormatter::with_indent(indentation.as_bytes()),
+            )
         } else {
-            serde_json::to_string(&value)
+            serialize_json(value, JinjaJsonFormatter)
         }
         .map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
@@ -1057,57 +1227,80 @@ mod builtins {
         })
     }
 
-    /// Indents Value with spaces
+    /// Indents a value with spaces.
     ///
     /// The first optional parameter to the filter can be set to `true` to
     /// indent the first line. The parameter defaults to false.
-    /// the second optional parameter to the filter can be set to `true`
+    /// The second optional parameter to the filter can be set to `true`
     /// to indent blank lines. The parameter defaults to false.
-    /// This filter is useful, if you want to template yaml-files
+    /// This filter is useful if you want to template YAML files.
     ///
     /// ```jinja
     /// example:
     ///   config:
-    /// {{ global_conifg|indent(2) }}          # does not indent first line
+    /// {{ global_config|indent(2) }}          # does not indent first line
     /// {{ global_config|indent(2,true) }}     # indent whole Value with two spaces
     /// {{ global_config|indent(2,true,true)}} # indent whole Value and all blank lines
     /// ```
+    ///
+    /// The parameters can also be provided as keyword arguments for
+    /// compatibility with Jinja2: `width`, `first`, and `blank`.
+    ///
+    /// ```jinja
+    /// {{ global_config|indent(width=4, first=true, blank=false) }}
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins"))))]
     pub fn indent(
-        mut value: String,
-        width: usize,
+        value: StringInput<'_>,
+        width: Option<usize>,
         indent_first_line: Option<bool>,
         indent_blank_lines: Option<bool>,
-    ) -> String {
-        fn strip_trailing_newline(input: &mut String) {
-            if input.ends_with('\n') {
-                input.truncate(input.len() - 1);
+        kwargs: Kwargs,
+    ) -> Result<Value, Error> {
+        fn strip_trailing_newline(mut input: &str) -> &str {
+            if let Some(stripped) = input.strip_suffix('\n') {
+                input = stripped;
             }
-            if input.ends_with('\r') {
-                input.truncate(input.len() - 1);
+            if let Some(stripped) = input.strip_suffix('\r') {
+                input = stripped;
             }
+            input
         }
 
-        strip_trailing_newline(&mut value);
+        let width = match width {
+            Some(width) => width,
+            None => ok!(kwargs.get::<Option<usize>>("width")).unwrap_or(4),
+        };
+        let indent_first_line = match indent_first_line {
+            Some(value) => value,
+            None => ok!(kwargs.get::<Option<bool>>("first")).unwrap_or(false),
+        };
+        let indent_blank_lines = match indent_blank_lines {
+            Some(value) => value,
+            None => ok!(kwargs.get::<Option<bool>>("blank")).unwrap_or(false),
+        };
+        ok!(kwargs.assert_all_used());
+
+        let input = strip_trailing_newline(value.as_str());
         let indent_with = " ".repeat(width);
         let mut output = String::new();
-        let mut iterator = value.split('\n');
-        if !indent_first_line.unwrap_or(false) {
+        let mut iterator = input.split('\n');
+        if !indent_first_line {
             output.push_str(iterator.next().unwrap());
             output.push('\n');
         }
         for line in iterator {
             if line.is_empty() {
-                if indent_blank_lines.unwrap_or(false) {
+                if indent_blank_lines {
                     output.push_str(&indent_with);
                 }
             } else {
-                write!(output, "{}{}", indent_with, line).ok();
+                write!(output, "{indent_with}{line}").ok();
             }
             output.push('\n');
         }
-        strip_trailing_newline(&mut output);
-        output
+        output.truncate(strip_trailing_newline(&output).len());
+        Ok(value.preserve_safety(output))
     }
 
     /// URL encodes a value.
@@ -1121,7 +1314,7 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins", feature = "urlencode"))))]
     #[cfg(feature = "urlencode")]
-    pub fn urlencode(value: Value) -> Result<String, Error> {
+    pub fn urlencode(value: &Value) -> Result<String, Error> {
         const SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
             .remove(b'/')
             .remove(b'.')
@@ -1150,7 +1343,7 @@ mod builtins {
             Ok(rv)
         } else {
             match &value.0 {
-                ValueRepr::None | ValueRepr::Undefined => Ok("".into()),
+                ValueRepr::None | ValueRepr::Undefined(_) => Ok("".into()),
                 ValueRepr::Bytes(b) => Ok(percent_encoding::percent_encode(b, SET).to_string()),
                 ValueRepr::String(..) | ValueRepr::SmallStr(_) => Ok(
                     percent_encoding::utf8_percent_encode(value.as_str().unwrap(), SET).to_string(),
@@ -1161,17 +1354,17 @@ mod builtins {
     }
 
     fn select_or_reject(
-        state: &State,
+        state: &mut State,
         invert: bool,
         value: Value,
         attr: Option<Cow<'_, str>>,
         test_name: Option<Cow<'_, str>>,
-        args: crate::value::Rest<Value>,
+        args: Vec<Value>,
     ) -> Result<Vec<Value>, Error> {
         let mut rv = vec![];
         let test = if let Some(test_name) = test_name {
             Some(ok!(state
-                .env
+                .env()
                 .get_test(&test_name)
                 .ok_or_else(|| Error::from(ErrorKind::UnknownTest))))
         } else {
@@ -1186,9 +1379,9 @@ mod builtins {
             let passed = if let Some(test) = test {
                 let new_args = Some(test_value)
                     .into_iter()
-                    .chain(args.0.iter().cloned())
+                    .chain(args.iter().cloned())
                     .collect::<Vec<_>>();
-                ok!(test.perform(state, &new_args))
+                ok!(test.call(state, &new_args)).is_true()
             } else {
                 test_value.is_true()
             };
@@ -1212,12 +1405,12 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn select(
-        state: &State,
+        state: &mut State,
         value: Value,
         test_name: Option<Cow<'_, str>>,
-        args: crate::value::Rest<Value>,
+        args: crate::value::Rest<ValueOrKwargs>,
     ) -> Result<Vec<Value>, Error> {
-        select_or_reject(state, false, value, None, test_name, args)
+        select_or_reject(state, false, value, None, test_name, args.into_values())
     }
 
     /// Creates a new sequence of values of which an attribute passes a test.
@@ -1231,13 +1424,20 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn selectattr(
-        state: &State,
+        state: &mut State,
         value: Value,
         attr: Cow<'_, str>,
         test_name: Option<Cow<'_, str>>,
-        args: crate::value::Rest<Value>,
+        args: crate::value::Rest<ValueOrKwargs>,
     ) -> Result<Vec<Value>, Error> {
-        select_or_reject(state, false, value, Some(attr), test_name, args)
+        select_or_reject(
+            state,
+            false,
+            value,
+            Some(attr),
+            test_name,
+            args.into_values(),
+        )
     }
 
     /// Creates a new sequence of values that don't pass a test.
@@ -1245,12 +1445,12 @@ mod builtins {
     /// This is the inverse of [`select`].
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn reject(
-        state: &State,
+        state: &mut State,
         value: Value,
         test_name: Option<Cow<'_, str>>,
-        args: crate::value::Rest<Value>,
+        args: crate::value::Rest<ValueOrKwargs>,
     ) -> Result<Vec<Value>, Error> {
-        select_or_reject(state, true, value, None, test_name, args)
+        select_or_reject(state, true, value, None, test_name, args.into_values())
     }
 
     /// Creates a new sequence of values of which an attribute does not pass a test.
@@ -1264,13 +1464,20 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn rejectattr(
-        state: &State,
+        state: &mut State,
         value: Value,
         attr: Cow<'_, str>,
         test_name: Option<Cow<'_, str>>,
-        args: crate::value::Rest<Value>,
+        args: crate::value::Rest<ValueOrKwargs>,
     ) -> Result<Vec<Value>, Error> {
-        select_or_reject(state, true, value, Some(attr), test_name, args)
+        select_or_reject(
+            state,
+            true,
+            value,
+            Some(attr),
+            test_name,
+            args.into_values(),
+        )
     }
 
     /// Applies a filter to a sequence of objects or looks up an attribute.
@@ -1301,13 +1508,14 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn map(
-        state: &State,
+        state: &mut State,
         value: Value,
-        args: crate::value::Rest<Value>,
+        args: crate::value::Rest<ValueOrKwargs>,
     ) -> Result<Vec<Value>, Error> {
         let mut rv = Vec::with_capacity(value.len().unwrap_or(0));
 
         // attribute mapping
+        let args = args.into_values();
         let (args, kwargs): (&[Value], Kwargs) = crate::value::from_args(&args)?;
 
         if let Some(attr) = ok!(kwargs.get::<Option<Value>>("attribute")) {
@@ -1349,7 +1557,7 @@ mod builtins {
         }));
 
         let filter = ok!(state
-            .env
+            .env()
             .get_filter(filter_name)
             .ok_or_else(|| Error::from(ErrorKind::UnknownFilter)));
         for value in ok!(state.undefined_behavior().try_iter(value)) {
@@ -1357,9 +1565,137 @@ mod builtins {
                 .into_iter()
                 .chain(args.iter().skip(1).cloned())
                 .collect::<Vec<_>>();
-            rv.push(ok!(filter.apply_to(state, &new_args)));
+            rv.push(ok!(filter.call(state, &new_args)));
         }
         Ok(rv)
+    }
+
+    /// Group a sequence of objects by an attribute.
+    ///
+    /// The attribute can use dot notation for nested access, like `"address.city"``.
+    /// The values are sorted first so only one group is returned for each unique value.
+    /// The attribute can be passed as first argument or as keyword argument named
+    /// `attribute`.
+    ///
+    /// For example, a list of User objects with a city attribute can be
+    /// rendered in groups. In this example, grouper refers to the city value of
+    /// the group.
+    ///
+    /// ```jinja
+    /// <ul>{% for city, items in users|groupby("city") %}
+    ///   <li>{{ city }}
+    ///   <ul>{% for user in items %}
+    ///     <li>{{ user.name }}
+    ///   {% endfor %}</ul>
+    /// </li>
+    /// {% endfor %}</ul>
+    /// ```
+    ///
+    /// groupby yields named tuples of `(grouper, list)``, which can be used instead
+    /// of the tuple unpacking above.  As such this example is equivalent:
+    ///
+    /// ```jinja
+    /// <ul>{% for group in users|groupby(attribute="city") %}
+    ///   <li>{{ group.grouper }}
+    ///   <ul>{% for user in group.list %}
+    ///     <li>{{ user.name }}
+    ///   {% endfor %}</ul>
+    /// </li>
+    /// {% endfor %}</ul>
+    /// ```
+    ///
+    /// You can specify a default value to use if an object in the list does not
+    /// have the given attribute.
+    ///
+    /// ```jinja
+    /// <ul>{% for city, items in users|groupby("city", default="NY") %}
+    ///   <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+    /// {% endfor %}</ul>
+    /// ```
+    ///
+    /// Like the [`sort`] filter, sorting and grouping is case-insensitive by default.
+    /// The key for each group will have the case of the first item in that group
+    /// of values. For example, if a list of users has cities `["CA", "NY", "ca"]``,
+    /// the "CA" group will have two values.  This can be disabled by passing
+    /// `case_sensitive=True`.
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn groupby(value: Value, attribute: Option<&str>, kwargs: Kwargs) -> Result<Value, Error> {
+        let default = ok!(kwargs.get::<Option<Value>>("default")).unwrap_or_default();
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let attr = match attribute {
+            Some(attr) => attr,
+            None => ok!(kwargs.get::<&str>("attribute")),
+        };
+        let mut items: Vec<Value> = ok!(value.try_iter()).collect();
+        safe_sort(&mut items, |a, b| {
+            let a = a.get_path_or_default(attr, &default);
+            let b = b.get_path_or_default(attr, &default);
+            cmp_helper(&a, &b, case_sensitive, false)
+        })?;
+        ok!(kwargs.assert_all_used());
+
+        #[derive(Debug)]
+        pub struct GroupTuple {
+            grouper: Value,
+            list: Vec<Value>,
+        }
+
+        impl Object for GroupTuple {
+            fn repr(self: &Arc<Self>) -> ObjectRepr {
+                ObjectRepr::Seq
+            }
+
+            fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+                match (key.as_usize(), key.as_str()) {
+                    (Some(0), None) | (None, Some("grouper")) => Some(self.grouper.clone()),
+                    (Some(1), None) | (None, Some("list")) => {
+                        Some(Value::make_object_iterable(self.clone(), |this| {
+                            Box::new(this.list.iter().cloned())
+                                as Box<dyn Iterator<Item = _> + Send + Sync>
+                        }))
+                    }
+                    _ => None,
+                }
+            }
+
+            fn enumerate(self: &Arc<Self>) -> Enumerator {
+                Enumerator::Seq(2)
+            }
+
+            fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple("")
+                    .field(&self.grouper)
+                    .field(&self.list)
+                    .finish()
+            }
+        }
+
+        let mut rv = Vec::new();
+        let mut grouper = None::<Value>;
+        let mut list = Vec::new();
+
+        for item in items {
+            let group_by = item.get_path_or_default(attr, &default);
+            if let Some(ref last_grouper) = grouper {
+                if cmp_helper(last_grouper, &group_by, case_sensitive, false) != Ordering::Equal {
+                    rv.push(Value::from_object(GroupTuple {
+                        grouper: last_grouper.clone(),
+                        list: std::mem::take(&mut list),
+                    }));
+                }
+            }
+            grouper = Some(group_by);
+            list.push(item);
+        }
+
+        if !list.is_empty() {
+            rv.push(Value::from_object(GroupTuple {
+                grouper: grouper.unwrap(),
+                list,
+            }));
+        }
+
+        Ok(Value::from_object(rv))
     }
 
     /// Returns a list of unique items from the given iterable.
@@ -1372,21 +1708,179 @@ mod builtins {
     /// The unique items are yielded in the same order as their first occurrence
     /// in the iterable passed to the filter.  The filter will not detect
     /// duplicate objects or arrays, only primitives such as strings or numbers.
+    ///
+    /// Optionally the `attribute` keyword argument can be used to make the filter
+    /// operate on an attribute instead of the value itself.  In this case only
+    /// one city per state would be returned:
+    ///
+    /// ```jinja
+    /// {{ list_of_cities|unique(attribute='state') }}
+    /// ```
+    ///
+    /// Like the [`sort`] filter this operates case-insensitive by default.
+    /// For example, if a list has the US state codes `["CA", "NY", "ca"]``,
+    /// the resulting list will have `["CA", "NY"]`.  This can be disabled by
+    /// passing `case_sensitive=True`.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn unique(values: Vec<Value>) -> Value {
+    pub fn unique(state: &State, values: Value, kwargs: Kwargs) -> Result<Value, Error> {
         use std::collections::BTreeSet;
+
+        let attr = ok!(kwargs.get::<Option<&str>>("attribute"));
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        ok!(kwargs.assert_all_used());
 
         let mut rv = Vec::new();
         let mut seen = BTreeSet::new();
 
-        for item in values {
-            if !seen.contains(&item) {
-                rv.push(item.clone());
-                seen.insert(item);
+        let iter = ok!(state.undefined_behavior().try_iter(values));
+        for item in iter {
+            let value_to_compare = if let Some(attr) = attr {
+                item.get_path_or_default(attr, &Value::UNDEFINED)
+            } else {
+                item.clone()
+            };
+            let memorized_value = if case_sensitive {
+                value_to_compare.clone()
+            } else if let Some(s) = value_to_compare.as_str() {
+                Value::from(s.to_lowercase())
+            } else {
+                value_to_compare.clone()
+            };
+
+            if !seen.contains(&memorized_value) {
+                rv.push(item);
+                seen.insert(memorized_value);
             }
         }
 
-        Value::from(rv)
+        Ok(Value::from(rv))
+    }
+
+    /// Chain two or more iterable objects as a single iterable object.
+    ///
+    /// If all the individual objects are dictionaries, then the final chained object
+    /// also acts like a dictionary -- you can lookup a key, or iterate over the keys
+    /// etc. Note that the dictionaries are not merged, so if there are duplicate keys,
+    /// then the lookup will return the value from the last matching dictionary in the
+    /// chain.
+    ///
+    /// If all the individual objects are sequences, then the final chained
+    /// object also acts like a list as if the lists are appended.
+    ///
+    /// Otherwise, the chained object acts like an iterator chaining individual
+    /// iterators, but it cannot be indexed.
+    ///
+    /// ```jinja
+    /// {{ users | chain(moreusers) | length }}
+    /// {% for user, info in shard0 | chain(shard1, shard2) | dictsort %}
+    ///   {{user}}: {{info}}
+    /// {% endfor %}
+    /// {{ list1 | chain(list2) | attr(1) }}
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn chain(
+        _state: &State,
+        value: Value,
+        others: crate::value::Rest<Value>,
+    ) -> Result<Value, Error> {
+        let all_values = Some(value.clone())
+            .into_iter()
+            .chain(others.0.iter().cloned())
+            .collect::<Vec<_>>();
+
+        if all_values.iter().all(|v| v.kind() == ValueKind::Map) {
+            Ok(Value::from_object(MergeDict::new(all_values)))
+        } else if all_values
+            .iter()
+            .all(|v| matches!(v.kind(), ValueKind::Seq))
+        {
+            Ok(Value::from_object(MergeSeq::new(all_values)))
+        } else {
+            // General iterator chaining behavior
+            Ok(Value::make_object_iterable(all_values, |values| {
+                Box::new(values.iter().flat_map(|v| match v.try_iter() {
+                    Ok(iter) => Box::new(iter) as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                    Err(err) => Box::new(Some(Value::from(err)).into_iter())
+                        as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                })) as Box<dyn Iterator<Item = Value> + Send + Sync>
+            }))
+        }
+    }
+
+    /// Zip multiple iterables into tuples.
+    ///
+    /// This filter works like the Python `zip` function. It takes one or more
+    /// iterables and returns an iterable of tuples where each tuple contains
+    /// one element from each input iterable. The iteration stops when the
+    /// shortest iterable is exhausted.
+    ///
+    /// ```jinja
+    /// {{ [1, 2, 3]|zip(['a', 'b', 'c']) }}
+    /// -> [(1, 'a'), (2, 'b'), (3, 'c')]
+    ///
+    /// {{ [1, 2]|zip(['a', 'b', 'c'], ['x', 'y', 'z']) }}
+    /// -> [(1, 'a', 'x'), (2, 'b', 'y')]
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn zip(_state: &State, value: Value, others: Rest<Value>) -> Result<Value, Error> {
+        let all_values = Some(value).into_iter().chain(others.0).collect::<Vec<_>>();
+
+        // Validate all values are iterable and calculate minimum length
+        let mut known_len: Option<usize> = None;
+        for val in &all_values {
+            match val.try_iter() {
+                Ok(_) => {
+                    // If all values have known lengths, track the minimum
+                    if let Some(len) = val.len() {
+                        known_len = Some(match known_len {
+                            None => len,
+                            Some(current_min) => current_min.min(len),
+                        });
+                    } else {
+                        // If any value doesn't have a known length, we can't know the zip length
+                        known_len = None;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("zip filter argument must be iterable, got {}", val.kind()),
+                    ));
+                }
+            }
+        }
+
+        Ok(Value::make_object_iterable(all_values, move |values| {
+            let iter = std::iter::from_fn({
+                let mut iters = values
+                    .iter()
+                    .map(|val| val.try_iter().ok())
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default();
+
+                move || {
+                    if iters.is_empty() {
+                        return None;
+                    }
+
+                    let mut tuple = Vec::with_capacity(iters.len());
+                    for iter in &mut iters {
+                        match iter.next() {
+                            Some(val) => tuple.push(val),
+                            None => return None,
+                        }
+                    }
+                    Some(Value::from(Tuple::from(tuple)))
+                }
+            });
+
+            if let Some(len) = known_len {
+                Box::new(LenIterWrap(len, iter)) as Box<dyn Iterator<Item = Value> + Send + Sync>
+            } else {
+                Box::new(iter) as Box<dyn Iterator<Item = Value> + Send + Sync>
+            }
+        }))
     }
 
     /// Pretty print a variable.
@@ -1394,7 +1888,66 @@ mod builtins {
     /// This is useful for debugging as it better shows what's inside an object.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn pprint(value: &Value) -> String {
-        format!("{:#?}", value)
+        format!("{value:#?}")
+    }
+
+    /// Apply the given values to a [printf-style] format string.
+    ///
+    /// ```jinja
+    /// {{ "%s, %s!"|format(greeting, name) }}
+    /// -> Hello, World!
+    /// ```
+    ///
+    /// In many cases, the [str.format()] style could be more convenient than the
+    /// printf-style formatting:
+    ///
+    /// ```jinja
+    /// {{ "{}, {name}!".format(greeting, name="Alice") }}
+    /// -> Hello, Alice!
+    /// ```
+    ///
+    /// This option is available through `minijinja-contrib`'s `pycompat` feature.
+    ///
+    /// [printf-style]: https://docs.python.org/3/library/stdtypes.html#printf-style-string-formatting
+    /// [str.format()]: https://docs.python.org/3/library/string.html#format-string-syntax
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn format(
+        state: &mut State,
+        format_str: &Value,
+        format_args: Rest<ValueOrKwargs>,
+    ) -> Result<Value, Error> {
+        let format_args = format_args.into_values();
+        let string = format_str
+            .as_str()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "value is not a string"))?;
+        if format_str.is_safe() {
+            let output = ok!(format_printf_with(
+                string,
+                &format_args,
+                |value, conversion| {
+                    if conversion == FormatConversion::Character {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            "character formatting is not supported for safe format strings",
+                        ));
+                    }
+
+                    // Strings are escaped before applying width and precision,
+                    // matching MarkupSafe.  Numbers stay typed so numeric
+                    // conversion specifiers continue to work.
+                    if value.is_safe()
+                        || matches!(value.kind(), ValueKind::Bool | ValueKind::Number)
+                    {
+                        Ok(None)
+                    } else {
+                        escape(state, value).map(|value| Some(Value::from(value.as_str().unwrap())))
+                    }
+                },
+            ));
+            Ok(Value::from_safe_string(output))
+        } else {
+            format_string(FormatStyle::Printf, string, &format_args).map(Value::from)
+        }
     }
 }
 

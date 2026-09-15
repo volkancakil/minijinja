@@ -2,10 +2,346 @@
 
 All notable changes to MiniJinja are documented here.
 
-## 2.2.1
+## Unreleased
 
+* Switched `minijinja-contrib` date and time filters from `time`/`time-tz` to Jiff. Custom formats now use `strftime`-style syntax instead of `time` format descriptions.  #694
+* Fixed the `title` filter treating every ASCII punctuation character as a word boundary in Rust and Go. Words now start after whitespace or one of `-`, `(`, `{`, `[` and `<` as in Jinja2, so `"don't"|title` renders as `Don't` instead of `Don'T`.
+
+## 3.0.0-alpha.0
+
+* Started the MiniJinja 3.0 alpha series. This release contains breaking API changes and is intended for testing.
+* Made mutable `State` the canonical path for functions, filters, tests, objects, methods, formatters, and nested macro calls. Read-only typed callbacks can continue to use `&State`; state mutation and dynamic calls now require `&mut State`. Added typed render-local extensions that persist through includes, blocks, and macros.
+* Removed `State::get_or_set_temp_object`; use typed render-local extensions instead of object wrappers and interior mutability.
+* Removed Rust APIs deprecated before 3.0: `Template::render_and_return_state`, `Template::render_to_write`, `Template::eval_to_state`, the `Filter`, `Test`, `TestResult`, and `ViaDeserialize` aliases, `value::intern`, and the no-op `key_interning` feature. The no-op `loader` feature was also removed; loader APIs remain available unconditionally.
+* Made `serde` optional, explicit, and disabled by default. Rendering APIs now accept `Into<Value>`; enable the feature and use the `value::Serde` wrapper for Serde conversion. Disabling the feature fully removes the dependency and no longer substitutes a fallback serialization trait.  #528
+* Added first-class tuple literals and public tuple value types in Rust and Go. Tuples now preserve their type through serialization and sequence operations, render like Python tuples, and roundtrip as tuples through the Python binding. JavaScript receives evaluated tuples as arrays.  #785
+* Changed sequence and map representations in Rust and Go to use Python-style string quoting, and changed `tojson` to use Jinja2-compatible separator spacing.  #785
+* Changed the MiniJinja-Go module path from `/v2` to `/v3`.
+* Fixed the JavaScript binding's `semi_strict` undefined behavior spelling.
+* Changed `context!` and `args!` to consume values and convert exclusively through `Into<Value>`; wrap Serde values in `value::Serde`.
+* Added native Rust tuple conversions and `Value::from_pairs`. Collecting pairs directly into `Value` now creates a sequence of tuples rather than a map.
+* Replaced `ViaDeserialize` with the unified `value::Serde` adapter for both explicit serialization and function argument deserialization.
+* Changed `Value` function arguments to reject implicit keyword-argument values. Variadic functions that intentionally capture them can use `ValueOrKwargs`.  #596
+
+## 2.24.0
+
+* Added the `wordwrap` filter to the Python bindings.  #885
+* Fixed conditional expressions in keyword argument values for Jinja2 compatibility in Rust and Go.  #921
+* Fixed `context!` sorting keys when the `preserve_order` feature is enabled.  #920
+* Limited string repetition to 100 MB in Rust and Go to prevent excessive memory allocations.
+
+## 2.23.0
+
+* Fixed Unicode identifiers in templates rendered through the Python bindings.
+
+## 2.22.0
+
+* Changed rendering of none and boolean values to `None`, `True`, and `False` for Jinja2 compatibility in Rust and Go.  #913
+* Added `StringInput` for custom Rust filters and functions that transform strings while preserving safety provenance.
+* Fixed safety handling in string-transforming and composing filters to preserve safe strings and escape unsafe fragments in Rust and Go.
+* Fixed the `split` filter to return a sequence, enabling negative indexing and slicing in Rust and Go.  #909
+* Fixed Python-compatible dict methods being shadowed by same-named map keys.  #903
+* Fixed loop-local assignments leaking into subsequent iterations in Rust and Go.  #912
+
+## 2.21.0
+
+* Fixed a panic when comparing two numbers that have no common lossless representation, such as a float against an integer that cannot be represented exactly as `f64` (for example `1.0 < 9007199254740993`).  #904
+* Fixed a stack overflow caused by repeated sequence concatenation.  #907
+* Improved performance of iteration over map items.  #906
+
+## 2.20.0
+
+* Added support for Jinja-style `required` blocks in Rust and Go, including `scoped required` parsing compatibility and validation that required blocks only contain whitespace or comments.
+* Added support for chained comparisons (for example `a < b < c`) in Rust and Go to match Jinja/Python semantics.
+* Fixed dotted integer lookup in the middle of attribute chains (for example `foo.0.bar`) for Jinja compatibility.  #900
+* Fixed compilation with `multi_template` disabled by gating block-only APIs behind the feature.
+
+## 2.19.0
+
+* Fixed strict undefined behavior for comparison operators (such as `==`), string concatenation (`~`), and undefined needles in the `in` operator to better match Jinja2.  #886 #888
+* Fixed the `default` filter in strict undefined mode so an explicitly passed undefined fallback argument errors instead of being treated like a missing argument.  #887
+
+## 2.18.0
+
+* Added keyword argument support (`width`, `first`, `blank`) to the `indent` filter for Jinja2 compatibility in Rust and Go.  #864
+* Added support for dotted integer lookup (for example `foo.0`) in Rust and Go for Jinja compatibility.  #881
+* Added support for dotted filter and test names (including `foo . bar . baz`) for Jinja compatibility.  #879
+* Fixed string escape handling to preserve unknown escapes (such as `\s`) for Jinja compatibility in Rust and Go.  #880
+* Improved generic performance across template parsing, compilation, and rendering.
+* Fixed `minijinja-cabi` ownership and pointer-safety issues that could leak `mj_value`
+  values on error paths.
+* Added high-priority `minijinja-cabi` APIs for callback-based functions/filters/tests,
+  globals, loaders, path joining, auto-escape configuration, and fuel limits.
+* Switched `minijinja-cabi` header maintenance to manual source-based syncing and
+  removed cbindgen-based generation tooling.
+* Added lightweight C smoke tests for `minijinja-cabi` (via `make -C minijinja-cabi test`)
+  with coverage across all exported C ABI functions, and wired them into top-level
+  testing and CI.
+* Added `render_captured` and `render_captured_to` methods on `Template` which
+  return a `Captured` type holding the rendered output and the template state.
+* Added `into_output` method on `Captured` to consume and return the output string.
+* Deprecated `render_and_return_state`, `eval_to_state`, and `render_to_write`
+  in favor of the new `render_captured` / `render_captured_to` / `Captured` API.
+
+## 2.17.1
+
+* Re-release of 2.17.0 to fix release automation.
+* Switched npm publishing to trusted publishing (OIDC/provenance) and removed token-based auth from CI.
+* Prevented duplicate crates.io publish attempts by skipping slash-prefixed tags in crates publishing.
+
+## 2.17.0
+
+* Added `'c'` (character) format type support for format filters and `str.format`-style formatting.  #868
+* Added prebuilt `minijinja-cli` release targets for `aarch64-pc-windows-msvc` (Windows ARM64) and `armv7-unknown-linux-gnueabihf`.
+* Fixed strict and semi-strict undefined handling so string-coercing filter/function arguments also fail for nested `Rest<String>` and `Vec<String>` conversions.  #877
+* Fixed Python CI/build compatibility with newer `maturin` by moving stripping from global config to release wheel build arguments.
+
+## 2.16.0
+
+* Added musllinux wheel builds for Python release artifacts.
+* Fixed `|escape` to honor custom formatters.  #861
+* Aligned undefined behavior handling in the Go port with Rust.
+* Removed non-Rust `keys` and `values` filters from the Go port for parity.  #863
+
+## 2.15.1
+
+* Re-release of 2.15.0 because of a bad release.
+
+## 2.15.0
+
+* Added `py.typed` marker for PEP 561 typing support in Python bindings.  #853
+* Added optional default argument to `map.get()` method in pycompat.  #852
+* Added a go language port.  #854
+* Fixed stability guarantees for the `|sort` filter when using `reverse=true`.  #856
+* Fixed missing `SemiStrict` undefined mapping in Python bindings.  #859
+
+## 2.14.0
+
+* Added support for tuple unpacking in `{% set %}` statements.  #847
+
+## 2.13.0
+
+* Added multi-key support to the `|sort` filter.  #827
+* Added `format` filter and `str.format` method for pycompat.  #835
+* Fix `not undefined` with strict undefined behavior.  #838
+* Added support for free threading Python.  #841
+* Added `setLoader` and `setPathJoinCallback` to the JavaScript bindings.  #842
+
+## 2.12.0
+
+* Item or attribute lookup will no longer swallow all errors in Python.  #814
+* Added `|zip` filter.  #818
+* Fix `break_on_hyphens` for the `|wordwrap` filter.  #823
+* Prefer error message from `unknown_method_callback`.  #824
+* Ignore `.jinja` and `.jinja2` as extensions in auto escape.  #832
+
+## 2.11.0
+
+* Fixed incorrect joining of leading undefineds or empty
+  strings in the `|join` filter.  This was inconsistent with
+  Jinja2 and the filter itself for undefineds in other
+  positions.  #794
+* Allow negative arguments to `range` function and change
+  range to `isize`.  #799
+* Allow `isize` as argument type.  #799
+* MiniJinja now correctly handles `\x` escape sequences in strings
+  as well as octals.  #805
+* Added a new `|chain` filter.  #807
+
+## 2.10.2
+
+* Fixed an issue with the function bounds that caused the
+  next-generation trait resolver to fail.  #787
+
+## 2.10.1
+
+- Re-release of 2.10.0 because of a broken release process.
+
+## 2.10.0
+
+- Fix incorrect permissions when `--output` is used in the CLI.  #772
+- Added `mj_err_get_debug_info` to the C-ABI.  #775
+- Modules now capture their output like they do in Jinja2.  This
+  means that if you do `{% import 'template.j2' as x %}` and you
+  then render `{{ x }}` the output of `template.j2` is rendered as
+  if it was included.  #778
+- Improved compatibility with Jinja2 for slicing.  Negative steps
+  are now correctly handled.  Additionally slicing on bytes now
+  correctly handles steps other than 1.  #781
+
+## 2.9.0
+
+- Do not panic if too large templates (too many lines or too many
+  columns) are loaded.  The error reporting will be wrong in those
+  cases but the templates will load.  #742
+- Fixed a bug that caused unknown method callbacks to not get
+  proper error reporting if they cannot find a method.  #743
+- Added `merge_maps` which is a dynamic version of the `context!`
+  merge feature, and fixed enumeration behavior when non-map objects
+  are attempted to be merged.  #745
+- Added `mj_value_new_bytes` to the C-ABI.  #749
+- Added `mj_value_as_bytes` to the C-ABI to borrow from strings or
+  byte values.  #750
+- Fixed buggy `mj_err_get_detail` and `mj_err_get_template_name`.  These
+  did not work correctly.  To fix them the return value now needs to be
+  freed.  #754
+- Fix a compilation issue on 32bit systems when `AtomicU64` is
+  not available in minijinja-contrib.  #755
+- Correctly handle `with context` and `without context` for
+  imports.  #759
+- The `default` filter is now also registered as `d` for Jinja2
+  compatibility.  #763
+- The `default` filter now accepts a second argument to enable lax
+  defaulting.  #764
+- Added a `striptags` filter to the contrib module.  #765
+- Enable `pycompat` by default for the Python bindings and register
+  the default contrib filters and tests.  #767
+
+## 2.8.0
+
+- Added `SemiStrict` undefined mode that is like strict but allows
+  to be checked for truthiness.  Additionally an if expression without
+  an else block will always produce a silent undefined object that
+  never errors for compatibility with Jinja2.  #687
+- Make the trait bounds of `ViaDeserialize` stricter.  Now the type
+  can only be constructed if the type implements `DeserializeOwned`.
+  This is not a new requirement for passing the function to
+  `add_function` but bad code will now error earlier for better
+  error reporting.  #689
+- Raise MSRV to 1.70.
+- The contrib crate now uses a basic xorrand implementation instead
+  of depending on all of the `rand` module.  #696
+- Added temps, a way to stash away temporary state during rendering.  #697
+- Fixed a bug that caused the random functions in the contrib crate
+  to not advance the RNG between calls.  #698
+- Added `Environment.undeclared_variables_in_template` and
+  `Environnent.undeclared_variables_in_str` to Python binding.  #699
+- Enable `loop_controls` for Python in-line with the CLI.  #704
+- Fixed a panic when comparing plain objects.  #705
+- Added `Object::custom_cmp` to allow objects to influence how they
+  compare against themselves.  This also fixes Python objects in the
+  Python binding not to compare correctly.  #707
+- Fixed a bug where `undeclared_variables` would incorrectly handle
+  variables referenced by macros.  #714
+- Fixed a deadlock in the Python binding when multiple threads were
+  rendering from the same environment at once.  #717
+- The Python bindings handle `__bool__` correctly now for custom
+  objects in if-conditions and filters.  #719
+- Fixed a bug where `}}` caused a syntax error in expressions with
+  open parentheses, braces or brackets.  #723
+- Added `State::known_variables` to return a list of known variables
+  and `Environment::globals`.  #724
+- Fixed an issue with undeclared variables not handling `caller`.  #725
+- Removed unnecessary `Filters` and `Tests` traits.  They remain as
+  hidden aliases to `Function`.  #726
+- Fixed a bug that caused implicit string concatenation to not correctly
+  handle escapes.  #728
+- Implemented constant folding in the code generator.  #731
+- Improved error reporting for bad loop recursion calls.  #734
+- The engine now uses smaller integers to represent columns, line numbers
+  and addresses.  This cuts down on the memory usage needed for debug
+  information.  #735
+- Added `load_from_path` to python.  #736
+- Added JavaScript bindings.  #737
+
+## 2.7.0
+
+- Removed string interning.  #675
+- `loop.nextitem` is now a lazy operation.  This prevents issues when
+  iterating over one-shot iterators combined with `{% break %}` and
+  it now ensures that the iterator is not running "one item ahead".  #677
+- Fixed an issue that caused loop aliasing not to be supported for
+  recursive loops.  #678
+- CLI moved from `serde_yml` to `serde_yaml`.  #684
+- Improved undefined error reporting.  Undefined values will now in most
+  cases point to exactly where the error happened.  #686
+- Allow newer notify dependency versions (up to 8.x) for the autoreload
+  crate.  #688
+
+## 2.6.0
+
+- Added `sum` filter.  #648
+- Added `truncate` filter to `minijinja-contrib`.  #647
+- Added `wordcount` filter to `minijinja-contrib`.  #649
+- Added `wordwrap` filter to `minijinja-contrib`.  #651
+- Some tests and filters now pass borrowed values for performance reasons
+  and a bug was fixed that caused undefined values in strict undefined
+  mode not to work with tests.  #657
+- Fixed an error reporting issue for some syntax errors.  #655
+- Removed an `unsafe` code block from the `Kwargs` type internally
+  which was probably unsafe.  #659
+- Fix a regression with latest serde that caused internals to leak
+  out when flattening on value handles is used.  #664
+- Added `Value::make_object_map` to create projections from object
+  into maps, similar to how it was already possible to create
+  iterators that were projected from objects.  #663
+- The `|items` filter will no longer allocate a list and instead
+  return an iterator.  #665
+- Fixed a bug that caused `lstrip_blocks` to act too eager.  #674
+
+## 2.5.0
+
+- `minijinja-cli` now supports preservation of order in maps.  #611
+- Fixed an issue where CBOR was not correctly deserialized in
+  `minijinja-cli`.  #611
+- Added a `lines` filter to split a string into lines.
+- Bytes are now better supported in MiniJinja.  They can be created from
+  `Value::from_bytes` without having to go via serde, and they are now
+  producing a nicer looking debug output.  #616
+- Added the missing `string` filter from Jinja2.  #617
+- Reversing bytes and convergint them implicitly to strings will now work
+  more consistently.  #619
+- Added type hints for the Python binding and relaxed maturin constraint.  #590
+- `minijinja-cli` now allows the template name to be set to an empty
+  string when `--template` is used, to allow suppliying a data file.  #624
+- Added the missing `sameas` filter from Jinja2.  #625
+- Tests can now support one argument without parentheses like in Jinja2
+  (`1 is sameas 1`).  #626
+- Added error context for strict undefined errors during template
+  rendering.  #627
+- Syntax errors caused by the lexer now include the correct position of
+  the error.  #630
+- `minijinja-cli` now has all features enabled by default as documented
+  (that means also shell completion and ini).  #633
+- `minijinja-cli` now does not convert INI files to lowercase anymore.  This was
+  an unintended behavior.  #633
+- Moved up MSRV to 1.63.0 due to indexmap.  #635
+- Added argument splatting support (`*args` for variable args and `**kwargs`
+  for keyword arguments) and fixed a bug where sometimes maps and keyword
+  arguments were created in inverse order.  #642
+
+## 2.4.0
+
+- Updated version of `minijinja-cli` with support for better documentation,
+  config file and environment variable support.  #602
+- `minijinja-cli` now supports template source passed by parameter for
+  simple cases.  #606
+- `minijinja-cli` now has a `--syntax-help` argument that prints out the
+  primer on the syntax.  #607
+- `minijinja-cli` now installs to `~/.local/bin` by default.  #608
+- Made the c-bindings compatible with wasm compilation.  #603
+- `String`/`Cow<str>` argument types will no longer implicitly convert
+  keyword arguments to string form.  This was an unintended foot gun.  #605
+
+## 2.3.1
+
+- Fixes a regression in `PartialEq` / `Eq` in `Value` caused by changes
+  in 2.3.0.  #584
+
+## 2.3.0
+
+- Fixes some compiler warnings in Rust 1.81.  #575
 - Fixes incorrect ordering of maps when the keys of those maps
   were not in consistent order.  #569
+- Implemented the missing `groupby` filter.  #570
+- The `unique` filter now is case insensitive by default like in
+  Jinja2 and supports an optional flag to make it case sensitive.
+  It also now lets one check individual attributes instead of
+  values.  #571
+- Changed sort order of `Ord` to avoid accidentally non total order
+  that could cause panics on Rust 1.81.  #579
+- Added a `Value::is_integer` method to allow a user to tell floats
+  and true integers apart.  #580
 
 ## 2.2.0
 
@@ -74,9 +410,9 @@ All notable changes to MiniJinja are documented here.
 ## 2.0.0
 
 This is a major update to MiniJinja that changes a lot of core internals and
-cleans up some APIs.  In particular it resolves somes limitations in the engine
+cleans up some APIs.  In particular it resolves some limitations in the engine
 in relation to working with dynamic objects, unlocks potentials for future
-performance improvments and enhancements.
+performance improvements and enhancements.
 
 It's very likely that you will need to do changes to your code when upgrading,
 particular when implementing dynamic objects.  In short:
@@ -128,6 +464,11 @@ For upgrade instructions read the [UPDATING](UPDATING.md) guide.
 - `UndefinedBehavior::Strict` now acts more delayed.  This means that now `value.key is defined` will no longer fail.
 - Added support for line statements and comments.  #503 
 - The CLI now accepts `--syntax` to reconfigure syntax flags such as delimiters.  #504
+
+## 1.0.22
+
+* Fixed an issue with the function bounds that caused the
+  next-generation trait resolver to fail.  #790
 
 ## 1.0.21
 
@@ -188,7 +529,7 @@ For upgrade instructions read the [UPDATING](UPDATING.md) guide.
   includes or extends from paths not explicitly allowlisted.  #432
 - Added support for `Error::display_debug_info` which displays just the
   debug info, same way as alternative display on the error does.  #420
-- Added the `namspace()` function from Jinja2 and the ability to assign
+- Added the `namespace()` function from Jinja2 and the ability to assign
   to it via `{% set %}`.  #422
 - `minijinja-autoreload` now supports `on_should_reload_callback` which
   lets one register a callback to be called just before an auto reload
@@ -310,7 +651,7 @@ For upgrade instructions read the [UPDATING](UPDATING.md) guide.
 
 - Added `json5` as file extension for JSON formatter.
 
-- The autoreload crate now supports fast reloading by just clearning the
+- The autoreload crate now supports fast reloading by just clearing the
   already templates.  This is enabled via `set_fast_reload` on the
   `Notifier`.
 

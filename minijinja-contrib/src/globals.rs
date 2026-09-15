@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-#[allow(unused)]
 use minijinja::value::Value;
 use minijinja::value::{from_args, Object, ObjectRepr};
 use minijinja::{Error, ErrorKind, State};
@@ -12,8 +11,8 @@ use minijinja::{Error, ErrorKind, State};
 #[cfg(feature = "datetime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "datetime")))]
 pub fn now() -> Value {
-    let now = time::OffsetDateTime::now_utc();
-    Value::from(((now.unix_timestamp_nanos() / 1000) as f64) / 1_000_000.0)
+    let now = jiff::Timestamp::now();
+    Value::from(((now.as_nanosecond() / 1000) as f64) / 1_000_000.0)
 }
 
 /// Returns a cycler.
@@ -47,13 +46,13 @@ pub fn cycler(items: Vec<Value>) -> Result<Value, Error> {
 
         fn call_method(
             self: &Arc<Self>,
-            _state: &State<'_, '_>,
+            _state: &mut State<'_, '_>,
             method: &str,
             args: &[Value],
         ) -> Result<Value, Error> {
             match method {
                 "next" => {
-                    from_args(args)?;
+                    let () = from_args(args)?;
                     let idx = self.pos.load(Ordering::Relaxed);
                     self.pos
                         .store((idx + 1) % self.items.len(), Ordering::Relaxed);
@@ -106,8 +105,12 @@ pub fn joiner(sep: Option<Value>) -> Value {
             ObjectRepr::Plain
         }
 
-        fn call(self: &Arc<Self>, _state: &State<'_, '_>, args: &[Value]) -> Result<Value, Error> {
-            from_args(args)?;
+        fn call(
+            self: &Arc<Self>,
+            _state: &mut State<'_, '_>,
+            args: &[Value],
+        ) -> Result<Value, Error> {
+            let () = from_args(args)?;
             let used = self.used.swap(true, Ordering::Relaxed);
             if used {
                 Ok(self.sep.clone())
@@ -123,22 +126,6 @@ pub fn joiner(sep: Option<Value>) -> Value {
     })
 }
 
-/// Returns the rng for the state
-#[cfg(feature = "rand")]
-pub(crate) fn get_rng(state: &State) -> rand::rngs::SmallRng {
-    use rand::rngs::SmallRng;
-    use rand::SeedableRng;
-
-    if let Some(seed) = state
-        .lookup("RAND_SEED")
-        .and_then(|x| u64::try_from(x).ok())
-    {
-        SmallRng::seed_from_u64(seed)
-    } else {
-        SmallRng::from_entropy()
-    }
-}
-
 /// Returns a random number in a given range.
 ///
 /// If only one parameter is provided it's taken as exclusive upper
@@ -149,15 +136,13 @@ pub(crate) fn get_rng(state: &State) -> rand::rngs::SmallRng {
 /// global context variable.
 #[cfg(feature = "rand")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rand")))]
-pub fn randrange(state: &State, n: i64, m: Option<i64>) -> i64 {
-    use rand::Rng;
-
+pub fn randrange(state: &mut State, n: i64, m: Option<i64>) -> i64 {
     let (lower, upper) = match m {
         None => (0, n),
         Some(m) => (n, m),
     };
 
-    get_rng(state).gen_range(lower..upper)
+    crate::rand::XorShiftRng::for_state(state).random_range(lower, upper)
 }
 
 /// Generates a random lorem ipsum.
@@ -174,13 +159,10 @@ pub fn randrange(state: &State, n: i64, m: Option<i64>) -> i64 {
 #[cfg(feature = "rand")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rand")))]
 pub fn lipsum(
-    state: &State,
+    state: &mut State,
     n: Option<usize>,
     kwargs: minijinja::value::Kwargs,
 ) -> Result<Value, Error> {
-    use rand::seq::SliceRandom;
-    use rand::Rng;
-
     #[rustfmt::skip]
     const LIPSUM_WORDS: &[&str] = &[
         "a", "ac", "accumsan", "ad", "adipiscing", "aenean", "aliquam",
@@ -223,21 +205,21 @@ pub fn lipsum(
     let n = n.or(n_kwargs).unwrap_or(5);
     let mut rv = String::new();
 
-    let mut rng = get_rng(state);
+    let rng = crate::rand::XorShiftRng::for_state(state);
 
     for _ in 0..n {
         let mut next_capitalized = true;
         let mut last_fullstop = 0;
         let mut last = "";
 
-        for idx in 0..rng.gen_range(min..max) {
+        for idx in 0..rng.random_range(min as i64, max as i64) {
             if idx > 0 {
                 rv.push(' ');
             } else if html {
                 rv.push_str("<p>");
             }
             let word = loop {
-                let word = LIPSUM_WORDS.choose(&mut rng).copied().unwrap_or("");
+                let word = LIPSUM_WORDS[rng.next_usize(LIPSUM_WORDS.len())];
                 if word != last {
                     last = word;
                     break word;
@@ -258,7 +240,7 @@ pub fn lipsum(
                 rv.push_str(word);
             }
 
-            if idx - last_fullstop > rng.gen_range(10..20) {
+            if idx - last_fullstop > rng.random_range(10, 20) {
                 rv.push('.');
                 last_fullstop = idx;
                 next_capitalized = true;

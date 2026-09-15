@@ -1,7 +1,177 @@
+# Updating to MiniJinja 3
+
+MiniJinja 3 aligns the value model more closely with Jinja2 and makes `serde`
+optional.  The changes below may require updates when moving from MiniJinja 2.
+
+## Removed Deprecated Rust APIs
+
+APIs deprecated before MiniJinja 3 have been removed:
+
+* Replace `Template::render_and_return_state` with `Template::render_captured`
+  and access the output and state through the returned `Captured` value.
+* Replace `Template::render_to_write` with `Template::render_captured_to`.
+* Replace `Template::eval_to_state` with `Template::render_captured`. To discard
+  output, use `render_captured_to` with `std::io::sink()`.
+* Replace the `filters::Filter` and `tests::Test` aliases with
+  `functions::Function`, and `tests::TestResult` with `value::FunctionResult`.
+* Replace `value::intern` with `Arc::<str>::from`. The no-op `key_interning`
+  Cargo feature has also been removed.
+* Remove the no-op `loader` Cargo feature from dependency declarations. Loader
+  APIs remain available unconditionally.
+
+## Formatting API
+
+The formatting helper and its style enum are no longer exported from the crate
+root. The helper was also renamed from `format_filter` to `format`, since it
+supports both the built-in `format` filter and Python-style `str.format()`:
+
+```rust
+// Old
+use minijinja::{format_filter, FormatStyle};
+
+// New
+use minijinja::formatting::{format, FormatStyle};
+```
+
+The `formatting` module is available when the `builtins` feature is enabled.
+
+## Mutable Execution State
+
+MiniJinja now uses mutable execution state for all dynamic calls.  Registered
+functions, filters, and tests can still take `&State` when they only inspect the
+render, or take `&mut State` as their first parameter when they need to modify
+render-local data or perform nested calls:
+
+```rust
+fn inspect(state: &State, value: Value) -> Value {
+    // Shared callbacks continue to work.
+    value
+}
+
+fn count(state: &mut State, value: Value) -> Value {
+    let calls = state.get_or_insert_extension::<usize>(0);
+    *calls += 1;
+    value
+}
+```
+
+The erased calling APIs now have a single mutable path.  Update custom
+`Object::call` and `Object::call_method` implementations, as well as direct
+`Value::call` and `Value::call_method` invocations, to pass `&mut State`.
+`State::call_macro`, `State::apply_filter`, and `State::perform_test` likewise
+require mutable state.  With `Captured`, use `with_state_mut`:
+
+```rust
+let mut captured = template.render_captured(context)?;
+let result = captured.with_state_mut(|state| state.call_macro("render", &[]))?;
+```
+
+State mutation no longer uses interior mutability.  `State::set_temp` now
+requires `&mut State`, and `State::get_or_set_temp_object` was removed.  Replace
+object temps with `get_extension`, `get_extension_mut`, or
+`get_or_insert_extension`, which provide render-local typed Rust storage without
+wrapping data in `Value` or a mutex.  Named temps remain available for data that
+needs to be represented as a `Value`.  Extensions persist through includes,
+blocks, and macro calls.
+
+Custom formatters and unknown-method callbacks now receive `&mut State` so they
+can use the same mutable facilities.
+
+## Go Module Path
+
+MiniJinja-Go now uses the major-version module path
+`github.com/mitsuhiko/minijinja/minijinja-go/v3`.  Update Go imports from `/v2`
+to `/v3`.  Its tuple values and collection rendering follow the same new
+semantics described below.  Most other changes of this document do not apply
+to the Go implementation.
+
+## Optional and Explicit Serde Support
+
+The `serde` feature now controls the `serde` dependency and is disabled by
+default.  You can enable it explicitly if you need to use the Serde based
+conversions but it might be unnecessary for most users.  The `deserialization`
+and `json` features enable it automatically as before.  The main rendering APIs,
+`context!`, and `args!` now convert values through `Into<Value>` rather than
+using Serde.
+
+Serde conversion must be requested with the `minijinja::value::Serde` wrapper:
+
+```rust
+use minijinja::value::{Serde, Value};
+
+let value = Value::from(Serde(&custom_data));
+let output = template.render(Serde(&custom_context))?;
+let context = minijinja::context!(data => Serde(&custom_data));
+```
+
+The same wrapper deserializes function arguments into Rust types:
+
+```rust
+use minijinja::value::Serde;
+
+fn dirname(path: Serde<std::path::PathBuf>) -> String {
+    path.display().to_string()
+}
+```
+
+The new `Serde` type replaces the former `ViaDeserialize` argument wrapper.
+
+`Value::from_serialize` has been removed. Replace it with the explicit `Serde`
+wrapper:
+
+```rust
+// Old
+let value = Value::from_serialize(&custom_data);
+
+// New
+let value = Value::from(Serde(&custom_data));
+```
+
+The `Serde` wrapper is unavailable when the `serde` feature is disabled.
+
+`context!` and `args!` consume expressions passed through native conversions via
+`Value::from`.  You can pass a reference where a supported native value should
+be cloned, or use `Serde(&value)` for borrowed Serde data.
+
+Collecting an iterator into `Value` now always creates a sequence, including
+when the items are tuples.  Use `Value::from_pairs(iter)` to explicitly create a
+map from key-value pairs.
+
+## Tuples
+
+Tuple literals now produce a distinct `Tuple` value instead of a `Vec<Value>`.
+Code that downcast tuple expressions to `Vec<Value>` must downcast to `Tuple` or
+use the generic sequence APIs.  Tuples still report `ValueKind::Seq` and support
+normal sequence iteration and indexing.
+
+Rust tuples passed through `Value::from` or explicit Serde conversion are also
+preserved as tuples.  Tuple concatenation, repetition, and slicing return tuples,
+while combining a list and a tuple with `+` is an error as it is in Python.
+
+For the Python bindings, Python tuples now remain tuples.  The JavaScript
+binding represents evaluated tuples as arrays while retaining tuple rendering
+inside templates.
+
+## Value Rendering
+
+Debug representations of strings, sequences, and maps now use Python-style
+quoting.  This primarily changes nested rendering from double quotes to single
+quotes where possible.  The `tojson` filter now inserts spaces after commas and
+colons to match Jinja2's default `json.dumps` output as this divergence has
+caused some unnecessary failures in conformity tests that some people use.
+
+## Keyword Arguments
+
+`Value`, `&Value`, `&[Value]`, and `Rest<Value>` function arguments no longer
+accept the internal keyword-argument map.  You now need to use an explicit
+`Kwargs` parameter for normal keyword arguments.  Variadic forwarding functions
+can use `Rest<ValueOrKwargs>` and call `into_values()` before manually splitting
+or forwarding the arguments.
+
 # Updating to MiniJinja 2
 
 MiniJinja 2.0 is a major update to MiniJinja that changes a lot of core
-internals and cleans up some APIs.  In particular it resolves somes limitations
+internals and cleans up some APIs.  In particular it resolves some limitations
 in the engine in relation to working with dynamic objects, unlocks potentials
 for future performance improvements and enhancements.  This document helps with
 upgrading to that version.
@@ -93,12 +263,12 @@ In a nutshell:
 
 When working with objects of an unknown type, you can use the new `DynObject`
 struct which is a type erased box over `Arc<Object>`.  `Value::as_object` now
-returns an `Option<&DynObject>` compared to previosly an `Option<&dyn Object>`
+returns an `Option<&DynObject>` compared to previously an `Option<&dyn Object>`
 as an example.  The `DynObject` can be cheaply cloned which bumps the reference
 count.
 
 On the value type, the object related APIs were changed a bit to better
-accomodate for the new trait:
+accommodate for the new trait:
 
 * `Value::as_struct` was removed, use `Value::as_object` instead.
 * `Value::as_seq` was removed, use `Value::as_object` instead.
@@ -206,7 +376,7 @@ let value = Value::from_seq_object(SimpleDynamicSeq(...));
 Because the default object representation is a `Map`, we need to
 change it to `ObjectRepr::seq` in the `repr` method.  As sequences
 iterate over their values, we can use the convenient `Enumerator::Seq`
-enumerator which instructs the engine to sequentually iterate over
+enumerator which instructs the engine to sequentially iterate over
 the object from `0` to the given `length`.  Otherwise the interface
 is the same as with the map above, which means that rather than
 implementing `get_item` you now also implement `get_value` which
@@ -313,7 +483,7 @@ impl Object for Markdown {
 
 ## Stack Ref
 
-The old `minijinja-stack-ref` module was removed as it can no longer accomodate the
+The old `minijinja-stack-ref` module was removed as it can no longer accommodate the
 new object model.  However that module largely is no longer useful as the new object
 system is powerful enough to support it _for the most part_.  While it's not possible
 any more to return references to objects on the stack, you can now trivially work with

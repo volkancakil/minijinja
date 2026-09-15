@@ -10,22 +10,17 @@ State {
     current_block: None,
     auto_escape: None,
     ctx: {
-        "x": 0,
-        "loop": Loop {
-            len: Some(
-                1,
-            ),
-            idx: 0,
-            depth: 0,
-        },
         "f": minijinja::functions::builtins::range,
+        "loop": <loop 0/1>,
         "one_shot_iterator": <iterator>,
         "upper": 1,
+        "x": 0,
     },
     env: Environment {
         globals: {
             "debug": minijinja::functions::builtins::debug,
             "dict": minijinja::functions::builtins::dict,
+            "get_args": test_templates::test_vm::{{closure}}::{{closure}},
             "namespace": minijinja::functions::builtins::namespace,
             "range": minijinja::functions::builtins::range,
         },
@@ -64,6 +59,7 @@ State {
             "number",
             "odd",
             "safe",
+            "sameas",
             "sequence",
             "startingwith",
             "string",
@@ -78,6 +74,7 @@ State {
             "batch",
             "bool",
             "capitalize",
+            "chain",
             "count",
             "d",
             "default",
@@ -86,12 +83,15 @@ State {
             "escape",
             "first",
             "float",
+            "format",
+            "groupby",
             "indent",
             "int",
             "items",
             "join",
             "last",
             "length",
+            "lines",
             "list",
             "lower",
             "map",
@@ -109,12 +109,15 @@ State {
             "slice",
             "sort",
             "split",
+            "string",
+            "sum",
             "title",
             "tojson",
             "trim",
             "unique",
             "upper",
             "urlencode",
+            "zip",
         ],
         templates: [
             "a_plus_b.txt",
@@ -122,8 +125,11 @@ State {
             "call_macro.txt",
             "debug.txt",
             "example_macro.txt",
+            "import-mixed.txt",
             "include_with_var_and_macro.txt",
             "layout_with_var.txt",
+            "required_layout.txt",
+            "required_mid.txt",
             "self-extends.txt",
             "self-include.txt",
             "simple2_layout.txt",
@@ -136,11 +142,11 @@ State {
     },
 }
 ---
-none
+None
 ---
 [
-    true,
-    false,
+    True,
+    False,
     42,
 ]
 ---

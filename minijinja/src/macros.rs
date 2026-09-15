@@ -23,29 +23,27 @@ macro_rules! some {
 /// Hidden utility module for the [`context!`](crate::context!) macro.
 #[doc(hidden)]
 pub mod __context {
-    pub use crate::value::merge_object::MergeObject;
-    use crate::value::{Value, ValueMap};
+    use crate::value::{StaticKeyMap, Value};
     use crate::Environment;
     use std::rc::Rc;
 
     #[inline(always)]
-    pub fn value_optimization() -> impl Drop {
-        crate::value::value_optimization()
+    pub fn make() -> Vec<(&'static str, Value)> {
+        Vec::new()
     }
 
     #[inline(always)]
-    pub fn make() -> ValueMap {
-        ValueMap::default()
+    pub fn add(ctx: &mut Vec<(&'static str, Value)>, key: &'static str, value: Value) {
+        if let Some((_, old_value)) = ctx.iter_mut().find(|(map_key, _)| *map_key == key) {
+            *old_value = value;
+        } else {
+            ctx.push((key, value));
+        }
     }
 
     #[inline(always)]
-    pub fn add(ctx: &mut ValueMap, key: &'static str, value: Value) {
-        ctx.insert(key.into(), value);
-    }
-
-    #[inline(always)]
-    pub fn build(ctx: ValueMap) -> Value {
-        Value::from_object(ctx)
+    pub fn build(ctx: Vec<(&'static str, Value)>) -> Value {
+        Value::from_object(StaticKeyMap(ctx))
     }
 
     pub fn thread_local_env() -> Rc<Environment<'static>> {
@@ -116,18 +114,13 @@ pub mod __context {
 ///
 /// The merge works with an value, not just values created by the `context!`
 /// macro and is performed lazy.  This means it also works with dynamic
-/// [`Object`](crate::value::Object)s.
+/// [`Object`](crate::value::Object)s.  The merge uses the underlying
+/// [`merge_maps`](crate::value::merge_maps) function.
 ///
 /// # Note on Conversions
 ///
-/// This macro uses [`Value::from_serialize`](crate::Value::from_serialize)
-/// for conversions.
-///
-/// This macro currently does not move passed values.  Future versions of
-/// MiniJinja are going to change the move behavior and it's recommended to not
-/// depend on this implicit reference behavior.  You should thus pass values
-/// with `&value` if you intend on still being able to reference them
-/// after the macro invocation.
+/// Values are converted through `Into<Value>`. To convert a Serde value,
+/// wrap it in `minijinja::value::Serde`.
 #[macro_export]
 macro_rules! context {
     () => {
@@ -137,32 +130,31 @@ macro_rules! context {
         $($key:ident $(=> $value:expr)?),*
         $(, .. $ctx:expr),* $(,)?
     ) => {{
-        let _guard = $crate::__context::value_optimization();
         let mut ctx = $crate::__context::make();
         $(
             $crate::__context_pair!(ctx, $key $(=> $value)?);
         )*
         let ctx = $crate::__context::build(ctx);
-        let mut merged_ctx = ::std::vec::Vec::new();
-        $(
-            merged_ctx.push($crate::value::Value::from($ctx));
-        )*;
-        if merged_ctx.is_empty() {
+        let merge_ctx = [
+            $(
+                $crate::value::Value::from($ctx),
+            )*
+        ];
+        if merge_ctx.is_empty() {
             ctx
         } else {
-            merged_ctx.insert(0, ctx);
-            $crate::value::Value::from_object($crate::__context::MergeObject(merged_ctx))
+            $crate::value::merge_maps(
+                merge_ctx.into_iter().rev().chain(::std::iter::once(ctx)))
         }
     }};
     (
         $(.. $ctx:expr),* $(,)?
     ) => {{
-        let _guard = $crate::__context::value_optimization();
-        let mut ctx = ::std::vec::Vec::new();
-        $(
-            ctx.push($crate::value::Value::from($ctx));
-        )*;
-        $crate::value::Value::from_object($crate::__context::MergeObject(ctx))
+        $crate::value::merge_maps([
+            $(
+                $crate::value::Value::from($ctx),
+            )*
+        ].into_iter().rev())
     }};
 }
 
@@ -172,11 +164,20 @@ macro_rules! __context_pair {
     ($ctx:ident, $key:ident) => {{
         $crate::__context_pair!($ctx, $key => $key);
     }};
+    ($ctx:ident, $key:ident => $value:literal) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::value::Value::from($value));
+    };
+    ($ctx:ident, $key:ident => context! { $($inner:tt)* }) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::context! { $($inner)* });
+    };
+    ($ctx:ident, $key:ident => context!($($inner:tt)*)) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::context!($($inner)*));
+    };
     ($ctx:ident, $key:ident => $value:expr) => {
         $crate::__context::add(
             &mut $ctx,
             stringify!($key),
-            $crate::value::Value::from_serialize(&$value),
+            $crate::__make_value!($value),
         );
     };
 }
@@ -197,17 +198,27 @@ macro_rules! __context_pair {
 /// ```
 /// # use minijinja::{value::Value, args, Environment};
 /// # let env = Environment::default();
-/// # let state = &env.empty_state();
+/// # let state = &mut env.empty_state();
 /// # let value = Value::from(());
 /// value.call(state, args!(1, 2, foo => "bar"));
 /// ```
 ///
-/// Note that this like [`context!`](crate::context) goes through
-/// [`Value::from_serialize`](crate::value::Value::from_serialize).
+/// Note that this, like [`context!`](crate::context), uses `Into<Value>`
+/// for conversions. Serde values can be wrapped in
+/// `minijinja::value::Serde`.
 #[macro_export]
 macro_rules! args {
     () => { &[][..] as &[$crate::value::Value] };
     ($($arg:tt)*) => { $crate::__args_helper!(branch [[$($arg)*]], [$($arg)*]) };
+}
+
+/// Converts an object into a value
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __make_value {
+    ($expr:expr) => {{
+        $crate::value::Value::from($expr)
+    }};
 }
 
 /// Utility macro for `args!`
@@ -226,36 +237,36 @@ macro_rules! __args_helper {
     (branch [[$e:expr, $($rest:tt)*]], $args:tt) => { $crate::__args_helper!(branch [[$($rest)*]], $args) };
 
     // creates args on the stack
-    (args [$($arg:tt)*]) => {{
+    (args [$($arg:tt)*]) => {&{
         let mut args = Vec::<$crate::value::Value>::new();
         $crate::__args_helper!(peel args, args, false, [$($arg)*]);
-        &(&{args})[..]
-    }};
+        args
+    }[..]};
 
     // creates args with kwargs on the stack
-    (kwargs [$($arg:tt)*]) => {{
+    (kwargs [$($arg:tt)*]) => {&{
         let mut args = Vec::<$crate::value::Value>::new();
         let mut kwargs = Vec::<(&str, $crate::value::Value)>::new();
         $crate::__args_helper!(peel args, kwargs, false, [$($arg)*]);
         args.push($crate::value::Kwargs::from_iter(kwargs.into_iter()).into());
-        &(&{args})[..]
-    }};
+        args
+    }[..]};
 
     // Peels a single argument from the arguments and stuffs them into
     // `$args` or `$kwargs` depending on type.
     (peel $args:ident, $kwargs:ident, $has_kwargs:ident, []) => {};
     (peel $args:ident, $kwargs:ident, $has_kwargs:ident, [$name:ident => $expr:expr]) => {
-        $kwargs.push((stringify!($name), $crate::value::Value::from_serialize(&$expr)));
+        $kwargs.push((stringify!($name), $crate::__make_value!($expr)));
     };
     (peel $args:ident, $kwargs:ident, $has_kwargs:ident, [$name:ident => $expr:expr, $($rest:tt)*]) => {
-        $kwargs.push((stringify!($name), $crate::value::Value::from_serialize(&$expr)));
+        $kwargs.push((stringify!($name), $crate::__make_value!($expr)));
         $crate::__args_helper!(peel $args, $kwargs, true, [$($rest)*]);
     };
     (peel $args:ident, $kwargs:ident, false, [$expr:expr]) => {
-        $args.push($crate::value::Value::from_serialize(&$expr));
+        $args.push($crate::__make_value!($expr));
     };
     (peel $args:ident, $kwargs:ident, false, [$expr:expr, $($rest:tt)*]) => {
-        $args.push($crate::value::Value::from_serialize(&$expr));
+        $args.push($crate::__make_value!($expr));
         $crate::__args_helper!(peel $args, $kwargs, false, [$($rest)*]);
     };
 }

@@ -23,11 +23,11 @@ pub enum Token<'a> {
     /// A borrowed string.
     Str(&'a str),
     /// An allocated string.
-    String(String),
+    String(Box<str>),
     /// An integer (limited to i64)
     Int(u64),
     /// A large integer
-    Int128(u128),
+    Int128(Box<u128>),
     /// A float
     Float(f64),
     /// A plus (`+`) operator.
@@ -44,8 +44,6 @@ pub enum Token<'a> {
     Pow,
     /// A mod (`%`) operator.
     Mod,
-    /// The bang (`!`) operator.
-    Bang,
     /// A dot operator (`.`)
     Dot,
     /// The comma operator (`,`)
@@ -84,7 +82,7 @@ pub enum Token<'a> {
     BraceClose,
 }
 
-impl<'a> fmt::Display for Token<'a> {
+impl fmt::Display for Token<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Token::TemplateData(_) => f.write_str("template-data"),
@@ -103,7 +101,6 @@ impl<'a> fmt::Display for Token<'a> {
             Token::FloorDiv => f.write_str("`//`"),
             Token::Pow => f.write_str("`**`"),
             Token::Mod => f.write_str("`%`"),
-            Token::Bang => f.write_str("`!`"),
             Token::Dot => f.write_str("`.`"),
             Token::Comma => f.write_str("`,`"),
             Token::Colon => f.write_str("`:`"),
@@ -120,8 +117,8 @@ impl<'a> fmt::Display for Token<'a> {
             Token::BracketClose => f.write_str("`]`"),
             Token::ParenOpen => f.write_str("`(`"),
             Token::ParenClose => f.write_str("`)`"),
-            Token::BraceOpen => f.write_str("`{{`"),
-            Token::BraceClose => f.write_str("`}}`"),
+            Token::BraceOpen => f.write_str("`{`"),
+            Token::BraceClose => f.write_str("`}`"),
         }
     }
 }
@@ -130,20 +127,31 @@ impl<'a> fmt::Display for Token<'a> {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Span {
-    pub start_line: u32,
-    pub start_col: u32,
+    pub start_line: u16,
+    pub start_col: u16,
     pub start_offset: u32,
-    pub end_line: u32,
-    pub end_col: u32,
+    pub end_line: u16,
+    pub end_col: u16,
     pub end_offset: u32,
 }
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            " @ {}:{}-{}:{}",
-            self.start_line, self.start_col, self.end_line, self.end_col
-        )
+        if f.alternate() {
+            f.debug_struct("Span")
+                .field("start_line", &self.start_line)
+                .field("start_col", &self.start_col)
+                .field("start_offset", &self.start_offset)
+                .field("end_line", &self.end_line)
+                .field("end_col", &self.end_col)
+                .field("end_offset", &self.end_offset)
+                .finish()
+        } else {
+            write!(
+                f,
+                " @ {}:{}-{}:{}",
+                self.start_line, self.start_col, self.end_line, self.end_col
+            )
+        }
     }
 }

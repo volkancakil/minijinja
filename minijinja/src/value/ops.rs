@@ -1,7 +1,26 @@
 use crate::error::{Error, ErrorKind};
-use crate::value::{DynObject, ObjectRepr, Value, ValueKind, ValueRepr};
+use crate::value::merge_object::MergeSeq;
+use crate::value::{DynObject, ObjectRepr, Tuple, Value, ValueKind, ValueRepr};
 
 const MIN_I128_AS_POS_U128: u128 = 170141183460469231731687303715884105728;
+const MAX_REPEATED_STRING_LEN: usize = 100_000_000;
+
+/// Iterator wrapper that provides exact size hints for iterators with known length.
+pub(crate) struct LenIterWrap<I: Send + Sync>(pub(crate) usize, pub(crate) I);
+
+impl<I: Iterator<Item = Value> + Send + Sync> Iterator for LenIterWrap<I> {
+    type Item = Value;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.1.next()
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0, Some(self.0))
+    }
+}
 
 pub enum CoerceResult<'a> {
     I128(i128, i128),
@@ -9,19 +28,30 @@ pub enum CoerceResult<'a> {
     Str(&'a str, &'a str),
 }
 
-pub(crate) fn as_f64(value: &Value) -> Option<f64> {
+pub(crate) fn as_f64(value: &Value, lossy: bool) -> Option<f64> {
+    macro_rules! checked {
+        ($expr:expr, $ty:ty) => {{
+            let rv = $expr as f64;
+            return if lossy || rv as $ty == $expr {
+                Some(rv)
+            } else {
+                None
+            };
+        }};
+    }
+
     Some(match value.0 {
         ValueRepr::Bool(x) => x as i64 as f64,
-        ValueRepr::U64(x) => x as f64,
-        ValueRepr::U128(x) => x.0 as f64,
-        ValueRepr::I64(x) => x as f64,
-        ValueRepr::I128(x) => x.0 as f64,
+        ValueRepr::U64(x) => checked!(x, u64),
+        ValueRepr::U128(x) => checked!(x.0, u128),
+        ValueRepr::I64(x) => checked!(x, i64),
+        ValueRepr::I128(x) => checked!(x.0, i128),
         ValueRepr::F64(x) => x,
         _ => return None,
     })
 }
 
-pub fn coerce<'x>(a: &'x Value, b: &'x Value) -> Option<CoerceResult<'x>> {
+pub fn coerce<'x>(a: &'x Value, b: &'x Value, lossy: bool) -> Option<CoerceResult<'x>> {
     match (&a.0, &b.0) {
         // equal mappings are trivial
         (ValueRepr::U64(a), ValueRepr::U64(b)) => Some(CoerceResult::I128(*a as i128, *b as i128)),
@@ -39,8 +69,8 @@ pub fn coerce<'x>(a: &'x Value, b: &'x Value) -> Option<CoerceResult<'x>> {
         (ValueRepr::F64(a), ValueRepr::F64(b)) => Some(CoerceResult::F64(*a, *b)),
 
         // are floats involved?
-        (ValueRepr::F64(a), _) => Some(CoerceResult::F64(*a, some!(as_f64(b)))),
-        (_, ValueRepr::F64(b)) => Some(CoerceResult::F64(some!(as_f64(a)), *b)),
+        (ValueRepr::F64(a), _) => Some(CoerceResult::F64(*a, some!(as_f64(b, lossy)))),
+        (_, ValueRepr::F64(b)) => Some(CoerceResult::F64(some!(as_f64(a, lossy)), *b)),
 
         // everything else goes up to i128
         _ => Some(CoerceResult::I128(
@@ -51,20 +81,21 @@ pub fn coerce<'x>(a: &'x Value, b: &'x Value) -> Option<CoerceResult<'x>> {
 }
 
 fn get_offset_and_len<F: FnOnce() -> usize>(
-    start: i64,
+    start: Option<i64>,
     stop: Option<i64>,
     end: F,
 ) -> (usize, usize) {
+    let start = start.unwrap_or(0);
     if start < 0 || stop.map_or(true, |x| x < 0) {
         let end = end();
         let start = if start < 0 {
-            (end as i64 + start) as usize
+            std::cmp::max(0, end as i64 + start) as usize
         } else {
             start as usize
         };
         let stop = match stop {
             None => end,
-            Some(x) if x < 0 => (end as i64 + x) as usize,
+            Some(x) if x < 0 => std::cmp::max(0, end as i64 + x) as usize,
             Some(x) => x as usize,
         };
         (start, stop.saturating_sub(start))
@@ -76,11 +107,36 @@ fn get_offset_and_len<F: FnOnce() -> usize>(
     }
 }
 
-pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Value, Error> {
-    let start: i64 = if start.is_none() {
-        0
+fn range_step_backwards(
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: usize,
+    end: usize,
+) -> impl Iterator<Item = usize> {
+    let start = match start {
+        None => end.saturating_sub(1),
+        Some(start) if start >= end as i64 => end.saturating_sub(1),
+        Some(start) if start >= 0 => start as usize,
+        Some(start) => (end as i64 + start).max(0) as usize,
+    };
+    let stop = match stop {
+        None => 0,
+        Some(stop) if stop < 0 => (end as i64 + stop).max(0) as usize,
+        Some(stop) => stop as usize,
+    };
+    let length = if stop == 0 {
+        (start + step) / step
     } else {
-        ok!(start.try_into())
+        (start - stop + step - 1) / step
+    };
+    (stop..=start).rev().step_by(step).take(length)
+}
+
+pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Value, Error> {
+    let start = if start.is_none() {
+        None
+    } else {
+        Some(ok!(start.try_into()))
     };
     let stop = if stop.is_none() {
         None
@@ -88,9 +144,9 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
         Some(ok!(i64::try_from(stop)))
     };
     let step = if step.is_none() {
-        1
+        1i64
     } else {
-        ok!(u64::try_from(step)) as usize
+        ok!(i64::try_from(step))
     };
     if step == 0 {
         return Err(Error::new(
@@ -100,35 +156,98 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
     }
 
     let kind = value.kind();
+    let is_tuple = value.is_tuple();
     let error = Err(Error::new(
         ErrorKind::InvalidOperation,
-        format!("value of type {} cannot be sliced", kind),
+        format!("value of type {kind} cannot be sliced"),
     ));
 
     match value.0 {
         ValueRepr::String(..) | ValueRepr::SmallStr(_) => {
             let s = value.as_str().unwrap();
-            let (start, len) = get_offset_and_len(start, stop, || s.chars().count());
-            Ok(Value::from(
-                s.chars()
-                    .skip(start)
-                    .take(len)
-                    .step_by(step)
-                    .collect::<String>(),
-            ))
+            if step > 0 {
+                let (start, len) = get_offset_and_len(start, stop, || s.chars().count());
+                Ok(Value::from(
+                    s.chars()
+                        .skip(start)
+                        .take(len)
+                        .step_by(step as usize)
+                        .collect::<String>(),
+                ))
+            } else {
+                let chars: Vec<char> = s.chars().collect();
+                Ok(Value::from(
+                    range_step_backwards(start, stop, -step as usize, chars.len())
+                        .map(move |i| chars[i])
+                        .collect::<String>(),
+                ))
+            }
         }
-        ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(Vec::<Value>::new())),
+        ValueRepr::Bytes(ref b) => {
+            if step > 0 {
+                let (start, len) = get_offset_and_len(start, stop, || b.len());
+                Ok(Value::from_bytes(
+                    b.iter()
+                        .skip(start)
+                        .take(len)
+                        .step_by(step as usize)
+                        .copied()
+                        .collect(),
+                ))
+            } else {
+                Ok(Value::from_bytes(
+                    range_step_backwards(start, stop, -step as usize, b.len())
+                        .map(|i| b[i])
+                        .collect::<Vec<u8>>(),
+                ))
+            }
+        }
+        ValueRepr::Undefined(_) | ValueRepr::None => Ok(Value::from(Vec::<Value>::new())),
         ValueRepr::Object(obj) if matches!(obj.repr(), ObjectRepr::Seq | ObjectRepr::Iterable) => {
-            Ok(Value::make_object_iterable(obj, move |obj| {
+            if is_tuple {
+                let values = obj
+                    .try_iter()
+                    .map(|iter| iter.collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let values: Vec<Value> = if step > 0 {
+                    let (start, len) = get_offset_and_len(start, stop, || values.len());
+                    values
+                        .into_iter()
+                        .skip(start)
+                        .take(len)
+                        .step_by(step as usize)
+                        .collect()
+                } else {
+                    range_step_backwards(start, stop, -step as usize, values.len())
+                        .map(|idx| values[idx].clone())
+                        .collect()
+                };
+                return Ok(Value::from(Tuple::from(values)));
+            }
+
+            if step > 0 {
                 let len = obj.enumerator_len().unwrap_or_default();
                 let (start, len) = get_offset_and_len(start, stop, || len);
-                // The manual match here is important that we do not mess up the size_hint
-                if let Some(iter) = obj.try_iter() {
-                    Box::new(iter.skip(start).take(len).step_by(step))
-                } else {
-                    Box::new(None.into_iter())
-                }
-            }))
+                Ok(Value::make_object_iterable(obj, move |obj| {
+                    if let Some(iter) = obj.try_iter() {
+                        Box::new(iter.skip(start).take(len).step_by(step as usize))
+                    } else {
+                        Box::new(None.into_iter())
+                    }
+                }))
+            } else {
+                Ok(Value::make_object_iterable(obj.clone(), move |obj| {
+                    if let Some(iter) = obj.try_iter() {
+                        let vec: Vec<Value> = iter.collect();
+                        Box::new(
+                            range_step_backwards(start, stop, -step as usize, vec.len())
+                                .map(move |i| vec[i].clone()),
+                        )
+                    } else {
+                        Box::new(None.into_iter())
+                    }
+                }))
+            }
         }
         _ => error,
     }
@@ -164,7 +283,7 @@ fn failed_op(op: &str, lhs: &Value, rhs: &Value) -> Error {
 macro_rules! math_binop {
     ($name:ident, $int:ident, $float:tt) => {
         pub fn $name(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
-            match coerce(lhs, rhs) {
+            match coerce(lhs, rhs, true) {
                 Some(CoerceResult::I128(a, b)) => match a.$int(b) {
                     Some(val) => Ok(int_as_value(val)),
                     None => Err(failed_op(stringify!($float), lhs, rhs))
@@ -176,23 +295,49 @@ macro_rules! math_binop {
     }
 }
 
+fn seq_concat_len(lhs: &Value, rhs: &Value) -> Option<usize> {
+    lhs.len()?.checked_add(rhs.len()?)
+}
+
+fn materialize_seq_concat(lhs: &Value, rhs: &Value, len: usize) -> Result<Value, Error> {
+    let mut rv = Vec::with_capacity(len);
+    rv.extend(ok!(lhs.try_iter()));
+    rv.extend(ok!(rhs.try_iter()));
+    Ok(Value::from(rv))
+}
+
 pub fn add(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
+    if lhs.is_tuple() || rhs.is_tuple() {
+        if lhs.is_tuple() && rhs.is_tuple() {
+            let mut values = Vec::with_capacity(seq_concat_len(lhs, rhs).unwrap_or_default());
+            values.extend(ok!(lhs.try_iter()));
+            values.extend(ok!(rhs.try_iter()));
+            return Ok(Value::from(Tuple::from(values)));
+        }
+        return Err(impossible_op("+", lhs, rhs));
+    }
+
     if matches!(lhs.kind(), ValueKind::Seq | ValueKind::Iterable)
         && matches!(rhs.kind(), ValueKind::Seq | ValueKind::Iterable)
     {
-        let lhs = lhs.clone();
-        let rhs = rhs.clone();
-        return Ok(Value::make_iterable(move || {
-            if let Ok(lhs) = lhs.try_iter() {
-                if let Ok(rhs) = rhs.try_iter() {
-                    return Box::new(lhs.chain(rhs))
-                        as Box<dyn Iterator<Item = Value> + Send + Sync>;
-                }
+        let values = vec![lhs.clone(), rhs.clone()];
+        let depth = MergeSeq::depth_for_values(&values);
+
+        // Keep sequence concatenation lazy by default.  The one case where we
+        // materialize eagerly is when repeated `seq = seq + [x]` has built a
+        // chain deep enough that later iteration or drop would risk one native
+        // stack frame per concatenation.  Only do that for sized operands;
+        // unsized iterables may represent streams and must not be consumed, so
+        // `MergeSeq` flattens only its own lazy structure instead.
+        if depth > MergeSeq::MAX_DEPTH {
+            if let Some(len) = seq_concat_len(lhs, rhs) {
+                return materialize_seq_concat(lhs, rhs, len);
             }
-            Box::new(None.into_iter()) as Box<dyn Iterator<Item = Value> + Send + Sync>
-        }));
+        }
+
+        return Ok(Value::from_object(MergeSeq::new_iterable(values)));
     }
-    match coerce(lhs, rhs) {
+    match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => a
             .checked_add(b)
             .ok_or_else(|| failed_op("+", lhs, rhs))
@@ -212,12 +357,19 @@ pub fn mul(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
         .map(|s| (s, rhs))
         .or_else(|| rhs.as_str().map(|s| (s, lhs)))
     {
-        return Ok(Value::from(s.repeat(ok!(n.as_usize().ok_or_else(|| {
+        let n = ok!(n.as_usize().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidOperation,
                 "strings can only be multiplied with integers",
             )
-        })))));
+        }));
+        if !matches!(s.len().checked_mul(n), Some(len) if len <= MAX_REPEATED_STRING_LEN) {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "repeated string is too large",
+            ));
+        }
+        return Ok(Value::from(s.repeat(n)));
     } else if let Some((seq, n)) = lhs
         .as_object()
         .map(|s| (s, rhs))
@@ -227,7 +379,7 @@ pub fn mul(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
         return repeat_iterable(n, seq);
     }
 
-    match coerce(lhs, rhs) {
+    match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => match a.checked_mul(b) {
             Some(val) => Ok(int_as_value(val)),
             None => Err(failed_op(stringify!(*), lhs, rhs)),
@@ -238,22 +390,6 @@ pub fn mul(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
 }
 
 fn repeat_iterable(n: &Value, seq: &DynObject) -> Result<Value, Error> {
-    struct LenIterWrap<I: Send + Sync>(usize, I);
-
-    impl<I: Iterator<Item = Value> + Send + Sync> Iterator for LenIterWrap<I> {
-        type Item = Value;
-
-        #[inline(always)]
-        fn next(&mut self) -> Option<Self::Item> {
-            self.1.next()
-        }
-
-        #[inline(always)]
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            (self.0, Some(self.0))
-        }
-    }
-
     let n = ok!(n.as_usize().ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidOperation,
@@ -267,6 +403,17 @@ fn repeat_iterable(n: &Value, seq: &DynObject) -> Result<Value, Error> {
             "cannot repeat unsized iterables",
         )
     }));
+
+    if let Some(tuple) = seq.downcast_ref::<Tuple>() {
+        let capacity = ok!(len.checked_mul(n).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidOperation, "repeated tuple is too large")
+        }));
+        let mut values = Vec::with_capacity(capacity);
+        for _ in 0..n {
+            values.extend(tuple.iter().cloned());
+        }
+        return Ok(Value::from(Tuple::from(values)));
+    }
 
     // This is not optimal.  We only query the enumerator for the length once
     // but we support repeated iteration.  We could both lie about our length
@@ -293,15 +440,15 @@ fn repeat_iterable(n: &Value, seq: &DynObject) -> Result<Value, Error> {
 
 pub fn div(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     fn do_it(lhs: &Value, rhs: &Value) -> Option<Value> {
-        let a = some!(as_f64(lhs));
-        let b = some!(as_f64(rhs));
+        let a = some!(as_f64(lhs, true));
+        let b = some!(as_f64(rhs, true));
         Some((a / b).into())
     }
     do_it(lhs, rhs).ok_or_else(|| impossible_op("/", lhs, rhs))
 }
 
 pub fn int_div(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
-    match coerce(lhs, rhs) {
+    match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => {
             if b != 0 {
                 a.checked_div_euclid(b)
@@ -318,7 +465,7 @@ pub fn int_div(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
 
 /// Implements a binary `pow` operation on values.
 pub fn pow(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
-    match coerce(lhs, rhs) {
+    match coerce(lhs, rhs, true) {
         Some(CoerceResult::I128(a, b)) => {
             match TryFrom::try_from(b).ok().and_then(|b| a.checked_pow(b)) {
                 Some(val) => Ok(int_as_value(val)),
@@ -403,6 +550,21 @@ mod tests {
     }
 
     #[test]
+    fn test_string_repeat_size_limit() {
+        let err = mul(&Value::from("ab"), &Value::from(50_000_001usize)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: repeated string is too large"
+        );
+
+        let err = mul(&Value::from("ab"), &Value::from(usize::MAX)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: repeated string is too large"
+        );
+    }
+
+    #[test]
     fn test_adding() {
         let err = add(&Value::from("a"), &Value::from(42)).unwrap_err();
         assert_eq!(
@@ -424,6 +586,120 @@ mod tests {
             err.to_string(),
             "invalid operation: unable to calculate 170141183460469231731687303715884105727 + 1"
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "wasi",
+        ignore = "std::thread::Builder::spawn is unsupported on WASI"
+    )]
+    fn test_repeated_seq_add_does_not_overflow_stack() {
+        // Regression test for repeated sequence concatenation, for example a
+        // chat-template accumulator `messages = messages + [m]` applied for
+        // many turns.  `+` may stay lazy, but must not build an unbounded chain
+        // of lazy iterables, otherwise enumerating the result (for example via
+        // `{{ messages | length }}` -> `Value::len()`) recurses one native frame
+        // per concatenation and overflows the stack.  Run on a small (1 MiB)
+        // stack so the regression aborts deterministically rather than
+        // depending on the platform default stack size.
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let n = 5000;
+                let mut acc = Value::from(Vec::<Value>::new());
+                for i in 0..n {
+                    acc = add(&acc, &Value::from(vec![Value::from(i)])).unwrap();
+                }
+                // The crash path: `|length` -> `Value::len()`.
+                assert_eq!(acc.len(), Some(n));
+                // Iteration must also work and stay correct.
+                assert_eq!(acc.try_iter().unwrap().count(), n);
+
+                let mut acc = Value::make_iterable(|| (0i64..).take_while(|_| false));
+                for i in 0..n {
+                    acc = add(&acc, &Value::from(vec![Value::from(i)])).unwrap();
+                }
+                // Unsized iterables cannot be eagerly materialized to cut off
+                // nesting, so iterating the lazy concat object must flatten its
+                // own nested concat nodes without recursion.
+                assert_eq!(acc.len(), None);
+                assert_eq!(acc.try_iter().unwrap().count(), n);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_sized_iterable_add_stays_lazy() {
+        struct CountingIter {
+            next_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            idx: usize,
+            len: usize,
+        }
+
+        impl Iterator for CountingIter {
+            type Item = Value;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.idx == self.len {
+                    return None;
+                }
+                let idx = self.idx;
+                self.idx += 1;
+                self.next_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Value::from(idx as i64))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let remaining = self.len - self.idx;
+                (remaining, Some(remaining))
+            }
+        }
+
+        let next_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lhs_next_count = next_count.clone();
+        let lhs = Value::make_iterable(move || CountingIter {
+            next_count: lhs_next_count.clone(),
+            idx: 0,
+            len: 2,
+        });
+        let rhs = Value::from(vec![Value::from(2), Value::from(3)]);
+
+        let res = add(&lhs, &rhs).unwrap();
+        assert_eq!(next_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Length remains known without consuming either side.
+        assert_eq!(res.len(), Some(4));
+        assert_eq!(next_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let got: Vec<i64> = res
+            .try_iter()
+            .unwrap()
+            .map(|v| i64::try_from(v).unwrap())
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        assert_eq!(next_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_unsized_iterable_add_stays_lazy() {
+        // An unsized iterable (no exact size hint) must NOT be eagerly
+        // materialized; the lazy-chaining fallback must still apply so adding
+        // to a potentially-unbounded stream stays lazy.
+        let unsized_iter = Value::make_iterable(|| (0i64..).take_while(|&x| x < 3));
+        assert_eq!(unsized_iter.len(), None, "precondition: operand is unsized");
+        let res = add(&unsized_iter, &Value::from(vec![Value::from(99)])).unwrap();
+        // Result is still a lazy iterable with unknown length...
+        assert_eq!(res.kind(), ValueKind::Iterable);
+        assert_eq!(res.len(), None);
+        // ...but iterates to the correct concatenated contents.
+        let got: Vec<i64> = res
+            .try_iter()
+            .unwrap()
+            .map(|v| i64::try_from(v).unwrap())
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 99]);
     }
 
     #[test]
@@ -481,6 +757,185 @@ mod tests {
         assert_eq!(
             string_concat(Value::from(23), &Value::from(42)),
             Value::from("2342")
+        );
+    }
+
+    #[test]
+    fn test_slicing() {
+        let v = Value::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // [::] - full slice
+        assert_eq!(
+            slice(v.clone(), Value::from(()), Value::from(()), Value::from(())).unwrap(),
+            Value::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        );
+
+        // [::2] - every 2nd element
+        assert_eq!(
+            slice(v.clone(), Value::from(()), Value::from(()), Value::from(2)).unwrap(),
+            Value::from(vec![0, 2, 4, 6, 8])
+        );
+
+        // [1:2:2] - slice with start, stop, step
+        assert_eq!(
+            slice(v.clone(), Value::from(1), Value::from(2), Value::from(2)).unwrap(),
+            Value::from(vec![1])
+        );
+
+        // [::-2] - reverse with step of 2
+        assert_eq!(
+            slice(v.clone(), Value::from(()), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from(vec![9, 7, 5, 3, 1])
+        );
+
+        // [:-8:] - from index 0 to -8
+        assert_eq!(
+            slice(v.clone(), Value::from(()), Value::from(-8), Value::from(())).unwrap(),
+            Value::from(vec![0, 1])
+        );
+
+        // [-8::] - from index -8 to the end
+        assert_eq!(
+            slice(v.clone(), Value::from(-8), Value::from(()), Value::from(())).unwrap(),
+            Value::from(vec![2, 3, 4, 5, 6, 7, 8, 9])
+        );
+
+        // [-11::] - from index -11 to the end, which is the same as [::]
+        // because the start index is before the start of the vector
+        assert_eq!(
+            slice(
+                v.clone(),
+                Value::from(-11),
+                Value::from(()),
+                Value::from(())
+            )
+            .unwrap(),
+            Value::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        );
+
+        // [:-11:] - from index -11 to the end, which is the same as [:0:]
+        // because the end index is before the start of the vector
+        assert_eq!(
+            slice(
+                v.clone(),
+                Value::from(()),
+                Value::from(-11),
+                Value::from(())
+            )
+            .unwrap(),
+            Value::from(Vec::<usize>::new())
+        );
+
+        // [2::-2] - from index 2 to start, reverse with step of 2
+        assert_eq!(
+            slice(v.clone(), Value::from(2), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from(vec![2, 0])
+        );
+
+        // [4:2:-2] - from index 4 to 2, reverse with step of 2
+        assert_eq!(
+            slice(v.clone(), Value::from(4), Value::from(2), Value::from(-2)).unwrap(),
+            Value::from(vec![4])
+        );
+
+        // [8:3:-2] - from index 8 to 3, reverse with step of 2
+        assert_eq!(
+            slice(v.clone(), Value::from(8), Value::from(3), Value::from(-2)).unwrap(),
+            Value::from(vec![8, 6, 4])
+        );
+    }
+
+    #[test]
+    fn test_string_slicing() {
+        let s = Value::from("abcdefghij");
+
+        // [::] - full slice
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(())).unwrap(),
+            Value::from("abcdefghij")
+        );
+
+        // [::2] - every 2nd character
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(2)).unwrap(),
+            Value::from("acegi")
+        );
+
+        // [1:2:2] - slice with start, stop, step
+        assert_eq!(
+            slice(s.clone(), Value::from(1), Value::from(2), Value::from(2)).unwrap(),
+            Value::from("b")
+        );
+
+        // [::-2] - reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from("jhfdb")
+        );
+
+        // [2::-2] - from index 2 to start, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(2), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from("ca")
+        );
+
+        // [4:2:-2] - from index 4 to 2, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(4), Value::from(2), Value::from(-2)).unwrap(),
+            Value::from("e")
+        );
+
+        // [8:3:-2] - from index 8 to 3, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(8), Value::from(3), Value::from(-2)).unwrap(),
+            Value::from("ige")
+        );
+    }
+
+    #[test]
+    fn test_bytes_slicing() {
+        let s = Value::from_bytes(b"abcdefghij".to_vec());
+
+        // [::] - full slice
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(())).unwrap(),
+            Value::from_bytes(b"abcdefghij".to_vec())
+        );
+
+        // [::2] - every 2nd character
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(2)).unwrap(),
+            Value::from_bytes(b"acegi".to_vec())
+        );
+
+        // [1:2:2] - slice with start, stop, step
+        assert_eq!(
+            slice(s.clone(), Value::from(1), Value::from(2), Value::from(2)).unwrap(),
+            Value::from_bytes(b"b".to_vec())
+        );
+
+        // [::-2] - reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(()), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from_bytes(b"jhfdb".to_vec())
+        );
+
+        // [2::-2] - from index 2 to start, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(2), Value::from(()), Value::from(-2)).unwrap(),
+            Value::from_bytes(b"ca".to_vec())
+        );
+
+        // [4:2:-2] - from index 4 to 2, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(4), Value::from(2), Value::from(-2)).unwrap(),
+            Value::from_bytes(b"e".to_vec())
+        );
+
+        // [8:3:-2] - from index 8 to 3, reverse with step of 2
+        assert_eq!(
+            slice(s.clone(), Value::from(8), Value::from(3), Value::from(-2)).unwrap(),
+            Value::from_bytes(b"ige".to_vec())
         );
     }
 }

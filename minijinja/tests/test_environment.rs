@@ -29,7 +29,6 @@ fn test_expression() {
 }
 
 #[test]
-#[cfg(feature = "loader")]
 fn test_expression_owned() {
     let env = Environment::new();
     let expr: minijinja::Expression<'_, 'static> = env
@@ -42,9 +41,16 @@ fn test_expression_owned() {
 }
 
 #[test]
-fn test_expression_bug() {
+fn test_trailing_garbage_rejected() {
     let env = Environment::new();
-    assert!(env.compile_expression("42.blahadsf()").is_err());
+    assert!(env.compile_expression("42 blahadsf").is_err());
+}
+
+#[test]
+fn test_int_method_call_compiles() {
+    let env = Environment::new();
+    let expr = env.compile_expression("42.blahadsf()").unwrap();
+    assert!(expr.eval(()).is_err());
 }
 
 #[test]
@@ -96,6 +102,10 @@ fn test_globals() {
     env.add_template("test", "{{ a }}").unwrap();
     let tmpl = env.get_template("test").unwrap();
     assert_eq!(tmpl.render(()).unwrap(), "42");
+    assert_eq!(
+        env.globals().map(|x| x.0).collect::<Vec<_>>(),
+        vec!["a", "debug", "dict", "namespace", "range"]
+    );
 }
 
 #[test]
@@ -158,17 +168,35 @@ fn test_unknown_method_callback() {
     use minijinja::{Error, ErrorKind};
 
     let mut env = Environment::new();
-    env.set_unknown_method_callback(|_state, value, method, args| {
+    env.set_unknown_method_callback(|state, value, method, args| {
         if value.kind() == ValueKind::Map && method == "items" {
-            from_args(args)?;
-            minijinja::filters::items(value.clone())
+            from_args::<()>(args)?;
+            state.set_temp("unknown_method_called", Value::from(true));
+            minijinja::filters::items(value)
         } else {
             Err(Error::from(ErrorKind::UnknownMethod))
         }
     });
 
-    let rv = env.render_str("{{ {'x': 42}.items() }}", ()).unwrap();
-    assert_snapshot!(rv, @r###"[["x", 42]]"###);
+    env.add_function("method_called", |state: &minijinja::State| {
+        state.get_temp("unknown_method_called").unwrap_or_default()
+    });
+    let rv = env
+        .render_str("{{ {'x': 42}.items() }}|{{ method_called() }}", ())
+        .unwrap();
+    assert_snapshot!(rv, @"[('x', 42)]|True");
+
+    let rv = env
+        .render_str("{{ {'items': 'field', 'x': 42}.items() | length }}", ())
+        .unwrap();
+    assert_eq!(rv, "2");
+
+    let err = env.render_str("{{ [].does_not_exist() }}", ()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnknownMethod);
+    assert_eq!(
+        err.detail(),
+        Some("sequence has no method named does_not_exist")
+    );
 }
 
 #[test]

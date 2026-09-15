@@ -1,13 +1,16 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::mem;
 
 use crate::compiler::ast;
 use crate::compiler::instructions::{
-    Instruction, Instructions, LocalId, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
+    CompareOp, Instruction, Instructions, LocalId, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR,
+    MAX_LOCALS,
 };
 use crate::compiler::tokens::Span;
 use crate::output::CaptureMode;
 use crate::value::ops::neg;
-use crate::value::Value;
+use crate::value::{Kwargs, UndefinedType, Value, ValueMap, ValueRepr};
 
 #[cfg(test)]
 use similar_asserts::assert_eq;
@@ -31,19 +34,84 @@ fn get_local_id<'source>(ids: &mut BTreeMap<&'source str, LocalId>, name: &'sour
     }
 }
 
+fn compare_op(op: ast::CompareOpKind) -> CompareOp {
+    match op {
+        ast::CompareOpKind::Eq => CompareOp::Eq,
+        ast::CompareOpKind::Ne => CompareOp::Ne,
+        ast::CompareOpKind::Lt => CompareOp::Lt,
+        ast::CompareOpKind::Lte => CompareOp::Lte,
+        ast::CompareOpKind::Gt => CompareOp::Gt,
+        ast::CompareOpKind::Gte => CompareOp::Gte,
+        ast::CompareOpKind::In => CompareOp::In,
+        ast::CompareOpKind::NotIn => CompareOp::NotIn,
+    }
+}
+
 /// Represents an open block of code that does not yet have updated
 /// jump targets.
 enum PendingBlock {
     Branch {
-        jump_instr: usize,
+        jump_instr: u32,
     },
     Loop {
-        iter_instr: usize,
-        jump_instrs: Vec<usize>,
+        iter_instr: u32,
+        jump_instrs: Vec<u32>,
     },
     ScBool {
-        jump_instrs: Vec<usize>,
+        jump_instrs: Vec<u32>,
     },
+}
+
+const CODEGEN_POOL_MAX_ITEMS: usize = 64;
+const CODEGEN_POOLED_MAX_CAPACITY: usize = 64;
+
+thread_local! {
+    static PENDING_BLOCK_POOL: RefCell<Vec<Vec<PendingBlock>>> = const { RefCell::new(Vec::new()) };
+    static SPAN_STACK_POOL: RefCell<Vec<Vec<Span>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline(always)]
+fn take_pending_block_buffer() -> Vec<PendingBlock> {
+    let mut buf = PENDING_BLOCK_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(8));
+    buf.clear();
+    buf
+}
+
+#[inline(always)]
+fn take_span_stack_buffer() -> Vec<Span> {
+    let mut buf = SPAN_STACK_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(8));
+    buf.clear();
+    buf
+}
+
+#[inline(always)]
+fn recycle_pending_block_buffer(mut buf: Vec<PendingBlock>) {
+    if buf.capacity() <= CODEGEN_POOLED_MAX_CAPACITY {
+        buf.clear();
+        PENDING_BLOCK_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < CODEGEN_POOL_MAX_ITEMS {
+                pool.push(buf);
+            }
+        });
+    }
+}
+
+#[inline(always)]
+fn recycle_span_stack_buffer(mut buf: Vec<Span>) {
+    if buf.capacity() <= CODEGEN_POOLED_MAX_CAPACITY {
+        buf.clear();
+        SPAN_STACK_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < CODEGEN_POOL_MAX_ITEMS {
+                pool.push(buf);
+            }
+        });
+    }
 }
 
 /// Provides a convenient interface to creating instructions for the VM.
@@ -51,7 +119,7 @@ pub struct CodeGenerator<'source> {
     instructions: Instructions<'source>,
     blocks: BTreeMap<&'source str, Instructions<'source>>,
     pending_block: Vec<PendingBlock>,
-    current_line: u32,
+    current_line: u16,
     span_stack: Vec<Span>,
     filter_local_ids: BTreeMap<&'source str, LocalId>,
     test_local_ids: BTreeMap<&'source str, LocalId>,
@@ -64,9 +132,9 @@ impl<'source> CodeGenerator<'source> {
         CodeGenerator {
             instructions: Instructions::new(file, source),
             blocks: BTreeMap::new(),
-            pending_block: Vec::with_capacity(32),
+            pending_block: take_pending_block_buffer(),
             current_line: 0,
-            span_stack: Vec::with_capacity(32),
+            span_stack: take_span_stack_buffer(),
             filter_local_ids: BTreeMap::new(),
             test_local_ids: BTreeMap::new(),
             raw_template_bytes: 0,
@@ -74,7 +142,7 @@ impl<'source> CodeGenerator<'source> {
     }
 
     /// Sets the current location's line.
-    pub fn set_line(&mut self, lineno: u32) {
+    pub fn set_line(&mut self, lineno: u16) {
         self.current_line = lineno;
     }
 
@@ -95,7 +163,7 @@ impl<'source> CodeGenerator<'source> {
     }
 
     /// Add a simple instruction with the current location.
-    pub fn add(&mut self, instr: Instruction<'source>) -> usize {
+    pub fn add(&mut self, instr: Instruction<'source>) -> u32 {
         if let Some(span) = self.span_stack.last() {
             if span.start_line == self.current_line {
                 return self.instructions.add_with_span(instr, *span);
@@ -105,13 +173,13 @@ impl<'source> CodeGenerator<'source> {
     }
 
     /// Add a simple instruction with other location.
-    pub fn add_with_span(&mut self, instr: Instruction<'source>, span: Span) -> usize {
+    pub fn add_with_span(&mut self, instr: Instruction<'source>, span: Span) -> u32 {
         self.instructions.add_with_span(instr, span)
     }
 
     /// Returns the next instruction index.
-    pub fn next_instruction(&self) -> usize {
-        self.instructions.len()
+    pub fn next_instruction(&self) -> u32 {
+        self.instructions.len() as u32
     }
 
     /// Creates a sub generator.
@@ -161,11 +229,11 @@ impl<'source> CodeGenerator<'source> {
             if push_did_not_iterate {
                 self.add(Instruction::PushDidNotIterate);
             };
-            self.add(Instruction::PopFrame);
+            self.add(Instruction::PopLoopFrame);
             for instr in jump_instrs.into_iter().chain(Some(iter_instr)) {
                 match self.instructions.get_mut(instr) {
-                    Some(Instruction::Iterate(ref mut jump_target))
-                    | Some(Instruction::Jump(ref mut jump_target)) => {
+                    Some(&mut Instruction::Iterate(ref mut jump_target))
+                    | Some(&mut Instruction::Jump(ref mut jump_target)) => {
                         *jump_target = loop_end;
                     }
                     _ => unreachable!(),
@@ -203,7 +271,7 @@ impl<'source> CodeGenerator<'source> {
 
     /// Emits a short-circuited bool operator.
     pub fn sc_bool(&mut self, and: bool) {
-        if let Some(PendingBlock::ScBool {
+        if let Some(&mut PendingBlock::ScBool {
             ref mut jump_instrs,
         }) = self.pending_block.last_mut()
         {
@@ -223,8 +291,8 @@ impl<'source> CodeGenerator<'source> {
         if let Some(PendingBlock::ScBool { jump_instrs }) = self.pending_block.pop() {
             for instr in jump_instrs {
                 match self.instructions.get_mut(instr) {
-                    Some(Instruction::JumpIfFalseOrPop(ref mut target))
-                    | Some(Instruction::JumpIfTrueOrPop(ref mut target)) => {
+                    Some(&mut Instruction::JumpIfFalseOrPop(ref mut target))
+                    | Some(&mut Instruction::JumpIfTrueOrPop(ref mut target)) => {
                         *target = end;
                     }
                     _ => unreachable!(),
@@ -233,12 +301,12 @@ impl<'source> CodeGenerator<'source> {
         }
     }
 
-    fn end_condition(&mut self, new_jump_instr: usize) {
+    fn end_condition(&mut self, new_jump_instr: u32) {
         match self.pending_block.pop() {
             Some(PendingBlock::Branch { jump_instr }) => {
                 match self.instructions.get_mut(jump_instr) {
-                    Some(Instruction::JumpIfFalse(ref mut target))
-                    | Some(Instruction::Jump(ref mut target)) => {
+                    Some(&mut Instruction::JumpIfFalse(ref mut target))
+                    | Some(&mut Instruction::Jump(ref mut target)) => {
                         *target = new_jump_instr;
                     }
                     _ => {}
@@ -325,14 +393,14 @@ impl<'source> CodeGenerator<'source> {
             }
             #[cfg(feature = "multi_template")]
             ast::Stmt::Import(import) => {
-                self.add(Instruction::BeginCapture(CaptureMode::Discard));
+                self.add(Instruction::BeginCapture(CaptureMode::Capture));
                 self.add(Instruction::PushWith);
                 self.compile_expr(&import.expr);
                 self.add_with_span(Instruction::Include(false), import.span());
+                self.add(Instruction::EndCapture);
                 self.add(Instruction::ExportLocals);
                 self.add(Instruction::PopFrame);
                 self.compile_assignment(&import.name);
-                self.add(Instruction::EndCapture);
             }
             #[cfg(feature = "multi_template")]
             ast::Stmt::FromImport(from_import) => {
@@ -384,7 +452,7 @@ impl<'source> CodeGenerator<'source> {
                 self.set_line_from_span(brk.span());
                 let instr = self.add(Instruction::Jump(0));
                 for pending_block in self.pending_block.iter_mut().rev() {
-                    if let PendingBlock::Loop {
+                    if let &mut PendingBlock::Loop {
                         ref mut jump_instrs,
                         ..
                     } = pending_block
@@ -407,6 +475,7 @@ impl<'source> CodeGenerator<'source> {
         for node in &block.body {
             sub.compile_stmt(node);
         }
+        sub.instructions.mark_required_block(block.required);
         let instructions = self.finish_subgenerator(sub);
         self.blocks.insert(block.name, instructions);
         self.add(Instruction::CallBlock(block.name));
@@ -455,7 +524,7 @@ impl<'source> CodeGenerator<'source> {
             flags |= MACRO_CALLER;
         }
         self.add(Instruction::BuildMacro(macro_decl.name, instr + 1, flags));
-        if let Some(Instruction::Jump(ref mut target)) = self.instructions.get_mut(instr) {
+        if let Some(&mut Instruction::Jump(ref mut target)) = self.instructions.get_mut(instr) {
             *target = macro_instr;
         } else {
             unreachable!();
@@ -480,8 +549,10 @@ impl<'source> CodeGenerator<'source> {
 
     fn compile_if_stmt(&mut self, if_cond: &ast::Spanned<ast::IfCond<'source>>) {
         self.set_line_from_span(if_cond.span());
+        self.push_span(if_cond.expr.span());
         self.compile_expr(&if_cond.expr);
         self.start_if();
+        self.pop_span();
         for node in &if_cond.true_body {
             self.compile_stmt(node);
         }
@@ -495,18 +566,18 @@ impl<'source> CodeGenerator<'source> {
     }
 
     fn compile_emit_expr(&mut self, expr: &ast::Spanned<ast::EmitExpr<'source>>) {
-        self.set_line_from_span(expr.span());
         if let ast::Expr::Call(call) = &expr.expr {
+            self.set_line_from_span(expr.expr.span());
             match call.identify_call() {
-                ast::CallType::Function(name) => {
-                    if name == "super" && call.args.is_empty() {
-                        self.add_with_span(Instruction::FastSuper, call.span());
-                        return;
-                    } else if name == "loop" && call.args.len() == 1 {
-                        self.compile_expr(&call.args[0]);
-                        self.add(Instruction::FastRecurse);
-                        return;
-                    }
+                #[cfg(feature = "multi_template")]
+                ast::CallType::Function("super") if call.args.is_empty() => {
+                    self.add_with_span(Instruction::FastSuper, call.span());
+                    return;
+                }
+                ast::CallType::Function("loop") if call.args.len() == 1 => {
+                    self.compile_call_args(std::slice::from_ref(&call.args[0]), 0, None);
+                    self.add_with_span(Instruction::FastRecurse, call.span());
+                    return;
                 }
                 #[cfg(feature = "multi_template")]
                 ast::CallType::Block(name) => {
@@ -516,8 +587,10 @@ impl<'source> CodeGenerator<'source> {
                 _ => {}
             }
         }
+        self.push_span(expr.expr.span());
         self.compile_expr(&expr.expr);
         self.add(Instruction::Emit);
+        self.pop_span();
     }
 
     fn compile_for_loop(&mut self, for_loop: &ast::Spanned<ast::ForLoop<'source>>) {
@@ -525,10 +598,11 @@ impl<'source> CodeGenerator<'source> {
 
         // filter expressions work like a nested for loop without
         // the special loop variable. in one loop, the condition is checked and
-        // passing items accumlated into a list. in the second, that list is
+        // passing items accumulated into a list. in the second, that list is
         // iterated over normally
         if let Some(ref filter_expr) = for_loop.filter_expr {
             self.add(Instruction::LoadConst(Value::from(0usize)));
+            self.push_span(filter_expr.span());
             self.compile_expr(&for_loop.iter);
             self.start_for_loop(false, false);
             self.add(Instruction::DupTop);
@@ -541,13 +615,17 @@ impl<'source> CodeGenerator<'source> {
             self.start_else();
             self.add(Instruction::DiscardTop);
             self.end_if();
+            self.pop_span();
             self.end_for_loop(false);
             self.add(Instruction::BuildList(None));
+            self.start_for_loop(true, for_loop.recursive);
         } else {
+            self.push_span(for_loop.iter.span());
             self.compile_expr(&for_loop.iter);
+            self.start_for_loop(true, for_loop.recursive);
+            self.pop_span();
         }
 
-        self.start_for_loop(true, for_loop.recursive);
         self.compile_assignment(&for_loop.target);
         for node in &for_loop.body {
             self.compile_stmt(node);
@@ -587,22 +665,26 @@ impl<'source> CodeGenerator<'source> {
 
     /// Compiles an expression.
     pub fn compile_expr(&mut self, expr: &ast::Expr<'source>) {
+        // try to do constant folding
+        if let Some(v) = expr.as_const() {
+            self.set_line_from_span(expr.span());
+            self.add(Instruction::LoadConst(v.clone()));
+            return;
+        }
+
         match expr {
             ast::Expr::Var(v) => {
                 self.set_line_from_span(v.span());
                 self.add(Instruction::Lookup(v.id));
             }
-            ast::Expr::Const(v) => {
-                self.set_line_from_span(v.span());
-                self.add(Instruction::LoadConst(v.value.clone()));
-            }
+            ast::Expr::Const(_) => unreachable!(), // handled by constant folding
             ast::Expr::Slice(s) => {
                 self.push_span(s.span());
                 self.compile_expr(&s.expr);
                 if let Some(ref start) = s.start {
                     self.compile_expr(start);
                 } else {
-                    self.add(Instruction::LoadConst(Value::from(0)));
+                    self.add(Instruction::LoadConst(Value::from(())));
                 }
                 if let Some(ref stop) = s.stop {
                     self.compile_expr(stop);
@@ -612,7 +694,7 @@ impl<'source> CodeGenerator<'source> {
                 if let Some(ref step) = s.step {
                     self.compile_expr(step);
                 } else {
-                    self.add(Instruction::LoadConst(Value::from(1)));
+                    self.add(Instruction::LoadConst(Value::from(())));
                 }
                 self.add(Instruction::Slice);
                 self.pop_span();
@@ -642,6 +724,9 @@ impl<'source> CodeGenerator<'source> {
             ast::Expr::BinOp(c) => {
                 self.compile_bin_op(c);
             }
+            ast::Expr::Compare(c) => {
+                self.compile_compare(c);
+            }
             ast::Expr::IfExpr(i) => {
                 self.set_line_from_span(i.span());
                 self.compile_expr(&i.test_expr);
@@ -651,7 +736,12 @@ impl<'source> CodeGenerator<'source> {
                 if let Some(ref false_expr) = i.false_expr {
                     self.compile_expr(false_expr);
                 } else {
-                    self.add(Instruction::LoadConst(Value::UNDEFINED));
+                    // special behavior: missing false block have a silent undefined
+                    // to permit special casing.  This is for compatibility also with
+                    // what Jinja2 does.
+                    self.add(Instruction::LoadConst(
+                        ValueRepr::Undefined(UndefinedType::Silent).into(),
+                    ));
                 }
                 self.end_if();
             }
@@ -660,21 +750,17 @@ impl<'source> CodeGenerator<'source> {
                 if let Some(ref expr) = f.expr {
                     self.compile_expr(expr);
                 }
-                for arg in &f.args {
-                    self.compile_expr(arg);
-                }
+                let arg_count = self.compile_call_args(&f.args, 1, None);
                 let local_id = get_local_id(&mut self.filter_local_ids, f.name);
-                self.add(Instruction::ApplyFilter(f.name, f.args.len() + 1, local_id));
+                self.add(Instruction::ApplyFilter(f.name, arg_count, local_id));
                 self.pop_span();
             }
             ast::Expr::Test(f) => {
                 self.push_span(f.span());
                 self.compile_expr(&f.expr);
-                for arg in &f.args {
-                    self.compile_expr(arg);
-                }
+                let arg_count = self.compile_call_args(&f.args, 1, None);
                 let local_id = get_local_id(&mut self.test_local_ids, f.name);
-                self.add(Instruction::PerformTest(f.name, f.args.len() + 1, local_id));
+                self.add(Instruction::PerformTest(f.name, arg_count, local_id));
                 self.pop_span();
             }
             ast::Expr::GetAttr(g) => {
@@ -694,40 +780,27 @@ impl<'source> CodeGenerator<'source> {
                 self.compile_call(c, None);
             }
             ast::Expr::List(l) => {
-                if let Some(val) = l.as_const() {
-                    self.add(Instruction::LoadConst(val));
-                } else {
-                    self.set_line_from_span(l.span());
-                    for item in &l.items {
-                        self.compile_expr(item);
-                    }
-                    self.add(Instruction::BuildList(Some(l.items.len())));
+                self.set_line_from_span(l.span());
+                for item in &l.items {
+                    self.compile_expr(item);
                 }
+                self.add(Instruction::BuildList(Some(l.items.len())));
+            }
+            ast::Expr::Tuple(t) => {
+                self.set_line_from_span(t.span());
+                for item in &t.items {
+                    self.compile_expr(item);
+                }
+                self.add(Instruction::BuildTuple(Some(t.items.len())));
             }
             ast::Expr::Map(m) => {
-                if let Some(val) = m.as_const() {
-                    self.add(Instruction::LoadConst(val));
-                } else {
-                    self.set_line_from_span(m.span());
-                    assert_eq!(m.keys.len(), m.values.len());
-                    for (key, value) in m.keys.iter().zip(m.values.iter()) {
-                        self.compile_expr(key);
-                        self.compile_expr(value);
-                    }
-                    self.add(Instruction::BuildMap(m.keys.len()));
+                self.set_line_from_span(m.span());
+                assert_eq!(m.keys.len(), m.values.len());
+                for (key, value) in m.keys.iter().zip(m.values.iter()) {
+                    self.compile_expr(key);
+                    self.compile_expr(value);
                 }
-            }
-            ast::Expr::Kwargs(m) => {
-                if let Some(val) = m.as_const() {
-                    self.add(Instruction::LoadConst(val));
-                } else {
-                    self.set_line_from_span(m.span());
-                    for (key, value) in &m.pairs {
-                        self.add(Instruction::LoadConst(Value::from(*key)));
-                        self.compile_expr(value);
-                    }
-                    self.add(Instruction::BuildKwargs(m.pairs.len()));
-                }
+                self.add(Instruction::BuildMap(m.keys.len()));
             }
         }
     }
@@ -740,7 +813,7 @@ impl<'source> CodeGenerator<'source> {
         self.push_span(c.span());
         match c.identify_call() {
             ast::CallType::Function(name) => {
-                let arg_count = self.compile_call_args(&c.args, caller);
+                let arg_count = self.compile_call_args(&c.args, 0, caller);
                 self.add(Instruction::CallFunction(name, arg_count));
             }
             #[cfg(feature = "multi_template")]
@@ -751,13 +824,13 @@ impl<'source> CodeGenerator<'source> {
             }
             ast::CallType::Method(expr, name) => {
                 self.compile_expr(expr);
-                let arg_count = self.compile_call_args(&c.args, caller);
-                self.add(Instruction::CallMethod(name, arg_count + 1));
+                let arg_count = self.compile_call_args(&c.args, 1, caller);
+                self.add(Instruction::CallMethod(name, arg_count));
             }
             ast::CallType::Object(expr) => {
                 self.compile_expr(expr);
-                let arg_count = self.compile_call_args(&c.args, caller);
-                self.add(Instruction::CallObject(arg_count + 1));
+                let arg_count = self.compile_call_args(&c.args, 1, caller);
+                self.add(Instruction::CallObject(arg_count));
             }
         };
         self.pop_span();
@@ -765,57 +838,164 @@ impl<'source> CodeGenerator<'source> {
 
     fn compile_call_args(
         &mut self,
-        args: &[ast::Expr<'source>],
+        args: &[ast::CallArg<'source>],
+        extra_args: usize,
         caller: Option<&Caller<'source>>,
-    ) -> usize {
-        match caller {
-            // we can conditionally compile the caller part here since this will
-            // nicely call through for non macro builds
-            #[cfg(feature = "macros")]
-            Some(caller) => self.compile_call_args_with_caller(args, caller),
-            _ => {
-                for arg in args {
-                    self.compile_expr(arg);
+    ) -> Option<u16> {
+        let mut pending_args = extra_args;
+        let mut num_args_batches = 0;
+        let mut has_kwargs = caller.is_some();
+        let mut static_kwargs = caller.is_none();
+
+        for arg in args {
+            match arg {
+                ast::CallArg::Pos(expr) => {
+                    self.compile_expr(expr);
+                    pending_args += 1;
                 }
-                args.len()
+                ast::CallArg::PosSplat(expr) => {
+                    if pending_args > 0 {
+                        self.add(Instruction::BuildList(Some(pending_args)));
+                        pending_args = 0;
+                        num_args_batches += 1;
+                    }
+                    self.compile_expr(expr);
+                    num_args_batches += 1;
+                }
+                ast::CallArg::Kwarg(_, expr) => {
+                    if !matches!(expr, ast::Expr::Const(_)) {
+                        static_kwargs = false;
+                    }
+                    has_kwargs = true;
+                }
+                ast::CallArg::KwargSplat(_) => {
+                    static_kwargs = false;
+                    has_kwargs = true;
+                }
             }
+        }
+
+        if has_kwargs {
+            let mut pending_kwargs = 0;
+            let mut num_kwargs_batches = 0;
+            let mut collected_kwargs = ValueMap::new();
+            for arg in args {
+                match arg {
+                    ast::CallArg::Kwarg(key, value) => {
+                        if static_kwargs {
+                            if let ast::Expr::Const(c) = value {
+                                collected_kwargs.insert(Value::from(*key), c.value.clone());
+                            } else {
+                                unreachable!();
+                            }
+                        } else {
+                            self.add(Instruction::LoadConst(Value::from(*key)));
+                            self.compile_expr(value);
+                            pending_kwargs += 1;
+                        }
+                    }
+                    ast::CallArg::KwargSplat(expr) => {
+                        if pending_kwargs > 0 {
+                            self.add(Instruction::BuildKwargs(pending_kwargs));
+                            num_kwargs_batches += 1;
+                            pending_kwargs = 0;
+                        }
+                        self.compile_expr(expr);
+                        num_kwargs_batches += 1;
+                    }
+                    ast::CallArg::Pos(_) | ast::CallArg::PosSplat(_) => {}
+                }
+            }
+
+            if !collected_kwargs.is_empty() {
+                self.add(Instruction::LoadConst(Kwargs::wrap(collected_kwargs)));
+            } else {
+                // The conditions above guarantee that if we collect static kwargs
+                // we cannot enter this block (single kwargs batch, no caller).
+
+                #[cfg(feature = "macros")]
+                {
+                    if let Some(caller) = caller {
+                        self.add(Instruction::LoadConst(Value::from("caller")));
+                        self.compile_macro_expression(caller);
+                        pending_kwargs += 1
+                    }
+                }
+                if num_kwargs_batches > 0 {
+                    if pending_kwargs > 0 {
+                        self.add(Instruction::BuildKwargs(pending_kwargs));
+                        num_kwargs_batches += 1;
+                    }
+                    self.add(Instruction::MergeKwargs(num_kwargs_batches));
+                } else {
+                    self.add(Instruction::BuildKwargs(pending_kwargs));
+                }
+            }
+            pending_args += 1;
+        }
+
+        if num_args_batches > 0 {
+            if pending_args > 0 {
+                self.add(Instruction::BuildList(Some(pending_args)));
+                num_args_batches += 1;
+            }
+            self.add(Instruction::UnpackLists(num_args_batches));
+            None
+        } else {
+            assert!(pending_args as u16 as usize == pending_args);
+            Some(pending_args as u16)
         }
     }
 
-    #[cfg(feature = "macros")]
-    fn compile_call_args_with_caller(
-        &mut self,
-        args: &[ast::Expr<'source>],
-        caller: &Caller<'source>,
-    ) -> usize {
-        let mut injected_caller = false;
-
-        // try to add the caller to already existing keyword arguments.
-        for arg in args {
-            if let ast::Expr::Kwargs(ref m) = arg {
-                self.set_line_from_span(m.span());
-                for (key, value) in &m.pairs {
-                    self.add(Instruction::LoadConst(Value::from(*key)));
-                    self.compile_expr(value);
-                }
-                self.add(Instruction::LoadConst(Value::from("caller")));
-                self.compile_macro_expression(caller);
-                self.add(Instruction::BuildKwargs(m.pairs.len() + 1));
-                injected_caller = true;
+    fn compile_compare(&mut self, c: &ast::Spanned<ast::Compare<'source>>) {
+        self.push_span(c.span());
+        self.compile_expr(&c.expr);
+        let mut cleanup_jumps = Vec::new();
+        for (idx, op) in c.ops.iter().enumerate() {
+            self.compile_expr(&op.expr);
+            if idx + 1 == c.ops.len() {
+                self.emit_compare(op.op);
             } else {
-                self.compile_expr(arg);
+                self.add(Instruction::CompareAndPreserve(compare_op(op.op)));
+                cleanup_jumps.push(self.add(Instruction::JumpIfFalseOrPop(!0)));
             }
         }
+        if !cleanup_jumps.is_empty() {
+            let jump_end = self.add(Instruction::Jump(!0));
+            let cleanup_start = self.next_instruction();
+            self.add(Instruction::Swap);
+            self.add(Instruction::DiscardTop);
+            let end = self.next_instruction();
+            for instr in cleanup_jumps {
+                match self.instructions.get_mut(instr) {
+                    Some(&mut Instruction::JumpIfFalseOrPop(ref mut target)) => {
+                        *target = cleanup_start;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            match self.instructions.get_mut(jump_end) {
+                Some(&mut Instruction::Jump(ref mut target)) => {
+                    *target = end;
+                }
+                _ => unreachable!(),
+            }
+        }
+        self.pop_span();
+    }
 
-        // if there are no keyword args so far, create a new kwargs object
-        // and add caller to that.
-        if !injected_caller {
-            self.add(Instruction::LoadConst(Value::from("caller")));
-            self.compile_macro_expression(caller);
-            self.add(Instruction::BuildKwargs(1));
-            args.len() + 1
-        } else {
-            args.len()
+    fn emit_compare(&mut self, op: ast::CompareOpKind) {
+        self.add(match op {
+            ast::CompareOpKind::Eq => Instruction::Eq,
+            ast::CompareOpKind::Ne => Instruction::Ne,
+            ast::CompareOpKind::Lt => Instruction::Lt,
+            ast::CompareOpKind::Lte => Instruction::Lte,
+            ast::CompareOpKind::Gt => Instruction::Gt,
+            ast::CompareOpKind::Gte => Instruction::Gte,
+            ast::CompareOpKind::In | ast::CompareOpKind::NotIn => Instruction::In,
+        });
+        if matches!(op, ast::CompareOpKind::NotIn) {
+            self.add(Instruction::Not);
         }
     }
 
@@ -866,12 +1046,14 @@ impl<'source> CodeGenerator<'source> {
 
     /// Converts the compiler into the instructions.
     pub fn finish(
-        self,
+        mut self,
     ) -> (
         Instructions<'source>,
         BTreeMap<&'source str, Instructions<'source>>,
     ) {
         assert!(self.pending_block.is_empty());
+        recycle_pending_block_buffer(mem::take(&mut self.pending_block));
+        recycle_span_stack_buffer(mem::take(&mut self.span_stack));
         (self.instructions, self.blocks)
     }
 }

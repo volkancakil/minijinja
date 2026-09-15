@@ -1,11 +1,14 @@
 use std::char::decode_utf16;
+#[cfg(feature = "builtins")]
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::iter::{once, repeat};
 use std::str::Chars;
+use std::sync::OnceLock;
 
 use crate::error::{Error, ErrorKind};
-use crate::value::{StringType, Value, ValueIter, ValueKind, ValueRepr};
+use crate::value::{StringType, UndefinedType, Value, ValueIter, ValueKind, ValueRepr};
 use crate::Output;
 
 /// internal marker to seal up some trait methods
@@ -27,24 +30,109 @@ pub(crate) fn untrusted_size_hint(value: usize) -> usize {
     value.min(1024)
 }
 
+const SMALL_INT_FORMAT_CACHE_LIMIT: usize = 256;
+
+#[inline(always)]
+fn small_u64_format(value: u64) -> Option<&'static str> {
+    static CACHE: OnceLock<Vec<Box<str>>> = OnceLock::new();
+
+    if value >= SMALL_INT_FORMAT_CACHE_LIMIT as u64 {
+        return None;
+    }
+
+    let cache = CACHE.get_or_init(|| {
+        (0..SMALL_INT_FORMAT_CACHE_LIMIT)
+            .map(|n| n.to_string().into_boxed_str())
+            .collect::<Vec<_>>()
+    });
+    Some(cache[value as usize].as_ref())
+}
+
+#[inline(always)]
+fn is_ascii_integer_str(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let (first, rest) = bytes.split_first().unwrap();
+    if *first == b'-' {
+        !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit())
+    } else {
+        first.is_ascii_digit() && rest.iter().all(|b| b.is_ascii_digit())
+    }
+}
+
+#[inline(always)]
+fn needs_html_escaping(s: &str) -> bool {
+    for &b in s.as_bytes() {
+        if b.wrapping_sub(b'"') <= b'>' - b'"'
+            && matches!(b, b'<' | b'>' | b'&' | b'"' | b'\'' | b'/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn write_with_html_escaping(out: &mut Output, value: &Value) -> fmt::Result {
-    if matches!(
+    match value.0 {
+        ValueRepr::U64(v) => {
+            return match small_u64_format(v) {
+                Some(s) => out.write_str(s),
+                None => write!(out, "{v}"),
+            }
+        }
+        ValueRepr::I64(v) if v >= 0 => {
+            return match small_u64_format(v as u64) {
+                Some(s) => out.write_str(s),
+                None => write!(out, "{v}"),
+            }
+        }
+        ValueRepr::I64(v) => return write!(out, "{v}"),
+        ValueRepr::Bool(v) => {
+            return out.write_str(if v { "True" } else { "False" });
+        }
+        _ => {}
+    }
+
+    if let ValueRepr::SmallStr(ref s) = value.0 {
+        let s = s.as_str();
+        if is_ascii_integer_str(s) {
+            return out.write_str(s);
+        }
+    }
+
+    if let Some(s) = value.as_str() {
+        if !needs_html_escaping(s) {
+            out.write_str(s)
+        } else {
+            write!(out, "{}", HtmlEscape(s))
+        }
+    } else if matches!(
         value.kind(),
         ValueKind::Undefined | ValueKind::None | ValueKind::Bool | ValueKind::Number
     ) {
         write!(out, "{value}")
-    } else if let Some(s) = value.as_str() {
-        write!(out, "{}", HtmlEscape(s))
     } else {
         write!(out, "{}", HtmlEscape(&value.to_string()))
     }
 }
 
+#[cold]
 fn invalid_autoescape(name: &str) -> Result<(), Error> {
     Err(Error::new(
         ErrorKind::InvalidOperation,
         format!("Default formatter does not know how to format to custom format '{name}'"),
     ))
+}
+
+#[cfg(feature = "json")]
+fn json_escape_write(out: &mut Output, value: &Value) -> Result<(), Error> {
+    let value = ok!(serde_json::to_string(&value).map_err(|err| {
+        Error::new(ErrorKind::BadSerialization, "unable to format to JSON").with_source(err)
+    }));
+    write!(out, "{value}").map_err(Error::from)
 }
 
 #[inline(always)]
@@ -53,27 +141,19 @@ pub fn write_escaped(
     auto_escape: AutoEscape,
     value: &Value,
 ) -> Result<(), Error> {
-    // common case of safe strings or strings without auto escaping
-    if let ValueRepr::String(ref s, ty) = value.0 {
-        if matches!(ty, StringType::Safe) || matches!(auto_escape, AutoEscape::None) {
-            return out.write_str(s).map_err(Error::from);
-        }
+    // string strings bypass all of this
+    if let ValueRepr::String(ref s, StringType::Safe) = value.0 {
+        return out.write_str(s).map_err(Error::from);
     }
 
     match auto_escape {
         AutoEscape::None => write!(out, "{value}").map_err(Error::from),
         AutoEscape::Html => write_with_html_escaping(out, value).map_err(Error::from),
         #[cfg(feature = "json")]
-        AutoEscape::Json => {
-            let value = ok!(serde_json::to_string(&value).map_err(|err| {
-                Error::new(ErrorKind::BadSerialization, "unable to format to JSON").with_source(err)
-            }));
-            write!(out, "{value}").map_err(Error::from)
-        }
+        AutoEscape::Json => json_escape_write(out, value),
         AutoEscape::Custom(name) => invalid_autoescape(name),
     }
 }
-
 /// Controls the autoescaping behavior.
 ///
 /// For more information see
@@ -106,9 +186,10 @@ pub enum AutoEscape {
 
 /// Defines the behavior of undefined values in the engine.
 ///
-/// At present there are three types of behaviors available which mirror the behaviors
-/// that Jinja2 provides out of the box.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// At present there are three types of behaviors available which mirror the
+/// behaviors that Jinja2 provides out of the box and an extra option called
+/// `SemiStrict` which is a slightly less strict undefined.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum UndefinedBehavior {
     /// The default, somewhat lenient undefined behavior.
@@ -116,43 +197,49 @@ pub enum UndefinedBehavior {
     /// * **printing:** allowed (returns empty string)
     /// * **iteration:** allowed (returns empty array)
     /// * **attribute access of undefined values:** fails
+    /// * **if true:** allowed (is considered false)
+    #[default]
     Lenient,
     /// Like `Lenient`, but also allows chaining of undefined lookups.
     ///
     /// * **printing:** allowed (returns empty string)
     /// * **iteration:** allowed (returns empty array)
     /// * **attribute access of undefined values:** allowed (returns [`undefined`](Value::UNDEFINED))
+    /// * **if true:** allowed (is considered false)
     Chainable,
+    /// Like strict, but does not error when the undefined is checked for truthyness.
+    ///
+    /// * **printing:** fails
+    /// * **iteration:** fails
+    /// * **attribute access of undefined values:** fails
+    /// * **string coercion in filters/functions:** fails
+    /// * **if true:** allowed (is considered false)
+    SemiStrict,
     /// Complains very quickly about undefined values.
     ///
     /// * **printing:** fails
     /// * **iteration:** fails
     /// * **attribute access of undefined values:** fails
+    /// * **string coercion in filters/functions:** fails
+    /// * **if true:** fails
     Strict,
-}
-
-impl Default for UndefinedBehavior {
-    fn default() -> UndefinedBehavior {
-        UndefinedBehavior::Lenient
-    }
 }
 
 impl UndefinedBehavior {
     /// Utility method used in the engine to determine what to do when an undefined is
     /// encountered.
     ///
-    /// The flag indicates if this is the first or second level of undefined value.  If
-    /// `parent_was_undefined` is set to `true`, the undefined was created by looking up
-    /// a missing attribute on an undefined value.  If `false` the undefined was created by
-    /// looking up a missing attribute on a defined value.
+    /// The flag indicates if this is the first or second level of undefined value.  The
+    /// parent value is passed too.
     pub(crate) fn handle_undefined(self, parent_was_undefined: bool) -> Result<Value, Error> {
         match (self, parent_was_undefined) {
             (UndefinedBehavior::Lenient, false)
             | (UndefinedBehavior::Strict, false)
+            | (UndefinedBehavior::SemiStrict, false)
             | (UndefinedBehavior::Chainable, _) => Ok(Value::UNDEFINED),
-            (UndefinedBehavior::Lenient, true) | (UndefinedBehavior::Strict, true) => {
-                Err(Error::from(ErrorKind::UndefinedError))
-            }
+            (UndefinedBehavior::Lenient, true)
+            | (UndefinedBehavior::Strict, true)
+            | (UndefinedBehavior::SemiStrict, true) => Err(Error::from(ErrorKind::UndefinedError)),
         }
     }
 
@@ -161,10 +248,12 @@ impl UndefinedBehavior {
     /// This fails only for strict undefined values.
     #[inline]
     pub(crate) fn is_true(self, value: &Value) -> Result<bool, Error> {
-        if matches!(self, UndefinedBehavior::Strict) && value.is_undefined() {
-            Err(Error::from(ErrorKind::UndefinedError))
-        } else {
-            Ok(value.is_true())
+        match (self, &value.0) {
+            // silent undefined doesn't error, even in strict mode
+            (UndefinedBehavior::Strict, &ValueRepr::Undefined(UndefinedType::Default)) => {
+                Err(Error::from(ErrorKind::UndefinedError))
+            }
+            _ => Ok(value.is_true()),
         }
     }
 
@@ -181,10 +270,31 @@ impl UndefinedBehavior {
     /// Are we strict on iteration?
     #[inline]
     pub(crate) fn assert_iterable(self, value: &Value) -> Result<(), Error> {
-        if matches!(self, UndefinedBehavior::Strict) && value.is_undefined() {
-            Err(Error::from(ErrorKind::UndefinedError))
-        } else {
-            Ok(())
+        match (self, &value.0) {
+            // silent undefined doesn't error, even in strict mode
+            (
+                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                &ValueRepr::Undefined(UndefinedType::Default),
+            ) => Err(Error::from(ErrorKind::UndefinedError)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks that undefined cannot be coerced into a concrete type (e.g. string).
+    ///
+    /// This is called when an undefined value is passed to a filter or function
+    /// argument that expects a concrete type.  Filters that explicitly handle
+    /// undefined values (such as `default`) avoid this by using `&Value` as
+    /// their first argument instead of a concrete type like `String`.
+    #[inline]
+    pub(crate) fn assert_value_not_undefined(self, value: &Value) -> Result<(), Error> {
+        match (self, &value.0) {
+            // silent undefined never errors
+            (
+                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                &ValueRepr::Undefined(UndefinedType::Default),
+            ) => Err(Error::from(ErrorKind::UndefinedError)),
+            _ => Ok(()),
         }
     }
 }
@@ -192,7 +302,7 @@ impl UndefinedBehavior {
 /// Helper to HTML escape a string.
 pub struct HtmlEscape<'a>(pub &'a str);
 
-impl<'a> fmt::Display for HtmlEscape<'a> {
+impl fmt::Display for HtmlEscape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[cfg(feature = "v_htmlescape")]
         {
@@ -264,7 +374,18 @@ impl Unescaper {
                             let val = ok!(self.parse_u16(&mut char_iter));
                             ok!(self.push_u16(val));
                         }
-                        _ => return Err(ErrorKind::BadEscape.into()),
+                        'x' => {
+                            let val = ok!(self.parse_hex_byte(&mut char_iter));
+                            ok!(self.push_char(val as char));
+                        }
+                        '0'..='7' => {
+                            let val = ok!(self.parse_octal_byte(d, &mut char_iter));
+                            ok!(self.push_char(val as char));
+                        }
+                        _ => {
+                            ok!(self.push_char('\\'));
+                            ok!(self.push_char(d));
+                        }
                     },
                 }
             } else {
@@ -282,6 +403,36 @@ impl Unescaper {
     fn parse_u16(&self, chars: &mut Chars) -> Result<u16, Error> {
         let hexnum = chars.chain(repeat('\0')).take(4).collect::<String>();
         u16::from_str_radix(&hexnum, 16).map_err(|_| ErrorKind::BadEscape.into())
+    }
+
+    fn parse_hex_byte(&self, chars: &mut Chars) -> Result<u8, Error> {
+        let hexnum = chars.take(2).collect::<String>();
+        if hexnum.len() != 2 {
+            return Err(ErrorKind::BadEscape.into());
+        }
+        u8::from_str_radix(&hexnum, 16).map_err(|_| ErrorKind::BadEscape.into())
+    }
+
+    fn parse_octal_byte(&self, first_digit: char, chars: &mut Chars) -> Result<u8, Error> {
+        let mut octal_str = String::new();
+        octal_str.push(first_digit);
+
+        // Collect up to 2 more octal digits (0-7)
+        for _ in 0..2 {
+            let next_char = chars.as_str().chars().next();
+            if let Some(c) = next_char {
+                if ('0'..='7').contains(&c) {
+                    octal_str.push(c);
+                    chars.next(); // consume the character
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        u8::from_str_radix(&octal_str, 8).map_err(|_| ErrorKind::BadEscape.into())
     }
 
     fn push_u16(&mut self, c: u16) -> Result<(), Error> {
@@ -313,7 +464,7 @@ impl Unescaper {
     }
 }
 
-/// Un-escape a string, following JSON rules.
+/// Un-escape a string, following Jinja-compatible string escape rules.
 pub fn unescape(s: &str) -> Result<String, Error> {
     Unescaper {
         out: String::new(),
@@ -324,23 +475,9 @@ pub fn unescape(s: &str) -> Result<String, Error> {
 
 pub struct BTreeMapKeysDebug<'a, K: fmt::Debug, V>(pub &'a BTreeMap<K, V>);
 
-impl<'a, K: fmt::Debug, V> fmt::Debug for BTreeMapKeysDebug<'a, K, V> {
+impl<K: fmt::Debug, V> fmt::Debug for BTreeMapKeysDebug<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.0.iter().map(|x| x.0)).finish()
-    }
-}
-
-pub struct OnDrop<F: FnOnce()>(Option<F>);
-
-impl<F: FnOnce()> OnDrop<F> {
-    pub fn new(f: F) -> Self {
-        Self(Some(f))
-    }
-}
-
-impl<F: FnOnce()> Drop for OnDrop<F> {
-    fn drop(&mut self) {
-        self.0.take().unwrap()();
     }
 }
 
@@ -384,11 +521,64 @@ pub fn splitn_whitespace(s: &str, maxsplits: usize) -> impl Iterator<Item = &str
     })
 }
 
+/// Because the Python crate violates our ordering guarantees by design
+/// we want to catch failed sorts in a landing pad.  This is not ideal but
+/// it at least gives us error context for when invalid search operations
+/// are taking place.
+#[cfg(feature = "builtins")]
+#[cfg_attr(not(feature = "internal_safe_search"), inline)]
+pub fn safe_sort<T, F>(seq: &mut [T], f: F) -> Result<(), Error>
+where
+    F: FnMut(&T, &T) -> Ordering,
+{
+    #[cfg(feature = "internal_safe_search")]
+    {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            seq.sort_by(f);
+        })) {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|x| x.as_str()));
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!(
+                    "failed to sort: {}",
+                    msg.unwrap_or("comparator does not implement total order")
+                ),
+            ));
+        }
+    }
+    #[cfg(not(feature = "internal_safe_search"))]
+    {
+        seq.sort_by(f);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use similar_asserts::assert_eq;
+
+    #[test]
+    fn test_small_u64_format_cache_bounds() {
+        assert_eq!(small_u64_format(0), Some("0"));
+
+        let last_cached = (SMALL_INT_FORMAT_CACHE_LIMIT - 1) as u64;
+        let expected = (SMALL_INT_FORMAT_CACHE_LIMIT - 1).to_string();
+        assert_eq!(small_u64_format(last_cached), Some(expected.as_str()));
+
+        assert_eq!(small_u64_format(SMALL_INT_FORMAT_CACHE_LIMIT as u64), None);
+    }
+
+    #[test]
+    fn test_small_u64_format_large_values_are_not_cached() {
+        // This value wraps to 0 when cast to usize on 32-bit targets.
+        assert_eq!(small_u64_format(u64::from(u32::MAX) + 1), None);
+        assert_eq!(small_u64_format(u64::MAX), None);
+    }
 
     #[test]
     fn test_html_escape() {
@@ -403,6 +593,39 @@ mod tests {
         assert_eq!(unescape(r"\t\b\f\r\n\\\/").unwrap(), "\t\x08\x0c\r\n\\/");
         assert_eq!(unescape("foobarbaz").unwrap(), "foobarbaz");
         assert_eq!(unescape(r"\ud83d\udca9").unwrap(), "💩");
+
+        // Test new escape sequences
+        assert_eq!(unescape(r"\0").unwrap(), "\0");
+        assert_eq!(unescape(r"foo\0bar").unwrap(), "foo\0bar");
+        assert_eq!(unescape(r"\x00").unwrap(), "\0");
+        assert_eq!(unescape(r"\x42").unwrap(), "B");
+        assert_eq!(unescape(r"\xab").unwrap(), "\u{ab}");
+        assert_eq!(unescape(r"foo\x42bar").unwrap(), "fooBbar");
+        assert_eq!(unescape(r"\x0a").unwrap(), "\n");
+        assert_eq!(unescape(r"\x0d").unwrap(), "\r");
+
+        // Unknown escapes are preserved as-is for Jinja compatibility.
+        assert_eq!(unescape(r"\s").unwrap(), r"\s");
+        assert_eq!(unescape(r"\q").unwrap(), r"\q");
+        assert_eq!(unescape(r"foo\sbar").unwrap(), r"foo\sbar");
+        assert_eq!(unescape(r"\8").unwrap(), r"\8");
+        assert_eq!(unescape(r"\9").unwrap(), r"\9");
+
+        // Test truncation
+        assert!(unescape(r"\x").is_err()); // truncated \x
+        assert!(unescape(r"\x1").is_err()); // truncated \x1
+        assert!(unescape(r"\x1g").is_err()); // invalid hex digit
+        assert!(unescape(r"\x1G").is_err()); // invalid hex digit
+
+        // Test octal escape sequences
+        assert_eq!(unescape(r"\0").unwrap(), "\0"); // octal 0 = null
+        assert_eq!(unescape(r"\1").unwrap(), "\x01"); // octal 1 = SOH
+        assert_eq!(unescape(r"\12").unwrap(), "\n"); // octal 12 = 10 decimal = LF
+        assert_eq!(unescape(r"\123").unwrap(), "S"); // octal 123 = 83 decimal = 'S'
+        assert_eq!(unescape(r"\141").unwrap(), "a"); // octal 141 = 97 decimal = 'a'
+        assert_eq!(unescape(r"\177").unwrap(), "\x7f"); // octal 177 = 127 decimal = DEL
+        assert_eq!(unescape(r"foo\123bar").unwrap(), "fooSbar"); // 'S' in the middle
+        assert_eq!(unescape(r"\101\102\103").unwrap(), "ABC"); // octal for A, B, C
     }
 
     #[test]
